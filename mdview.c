@@ -13,17 +13,21 @@
 #include <ole2.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <winhttp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
 #include <wchar.h>
+#ifdef MDV_TEST
+#include <shlobj.h>
+#endif
 
 #define APP L"MD View"
 #define REGKEY L"Software\\MDView"
 
 enum { ID_OPEN = 100, ID_SAVE, ID_SAVEAS, ID_EDIT, ID_THEME, ID_ZOOMOUT, ID_ZOOMIN, ID_ZOOM0,
-       ID_FIND, ID_NEXT, ID_PREV, ID_ESC, ID_NEW, ID_RELOAD, ID_HELP,
+       ID_FIND, ID_NEXT, ID_PREV, ID_ESC, ID_NEW, ID_RELOAD, ID_HELP, ID_CLEAR, ID_UPDATE, ID_UPDCHECK,
        IDC_EDITOR = 200, IDC_VIEW, IDC_SEARCH, IDC_COUNT,
        IDM_COPY = 300, IDM_SELALL, IDM_CUT, IDM_PASTE, IDM_UNDO };
 enum { T_RENDER = 1, T_RESIZE, T_FIND };
@@ -47,7 +51,8 @@ static Theme T;
 typedef struct { int a, b; wchar_t *url; } Link;
 typedef struct { int pos; wchar_t slug[128]; } Head;
 
-static HWND hMain, hEdit, hView, hSearch, hCount, hBtn[9];
+static HWND hMain, hEdit, hView, hSearch, hCount, hBtn[11];
+static RECT g_searchRc;  /* ramcek okolo hladacieho pola */
 static int g_help = 0;   /* 1 = v nahlade je zobrazeny vstavany navod */
 static HWND g_lastPane;
 static WNDPROC g_reProc, g_edProc;
@@ -76,7 +81,8 @@ static const wchar_t WELCOME[] =
     L"| `Ctrl+C` | Kopírovať označený text |\n"
     L"| `Ctrl +` / `Ctrl −` / `Ctrl+0` | Veľkosť písma |\n"
     L"| `F5` | Znovu načítať súbor z disku |\n"
-    L"| `F1` | Návod |\n";
+    L"| `F1` | Návod |\n"
+    L"| `Ctrl+U` | Skontrolovať aktualizácie |\n";
 
 /* ---------- buffre ---------- */
 typedef struct { char *p; size_t n, cap; } SB;
@@ -129,6 +135,47 @@ static wchar_t *get_text(HWND h, int crlf, int *outn) {
     if (got < 0) got = 0; if (got > n) got = n;
     w[got] = 0; if (outn) *outn = got; return w;
 }
+
+/* ---------- drag & drop suborov (vlastny OLE drop target) ----------
+   RichEdit si registruje vlastny drop target, ktory subory neprijima; nahradzame ho tymto. */
+#define WM_APP_DROP (WM_APP + 1)
+static wchar_t g_dropPath[1024];
+static int g_dropOk;
+static FORMATETC g_fmtDrop = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+static HRESULT STDMETHODCALLTYPE DT_QI(IDropTarget *t, REFIID r, void **o) {
+    if (IsEqualIID(r, &IID_IUnknown) || IsEqualIID(r, &IID_IDropTarget)) { *o = t; return S_OK; }
+    *o = NULL; return E_NOINTERFACE;
+}
+static ULONG STDMETHODCALLTYPE DT_AddRef(IDropTarget *t) { (void)t; return 2; }
+static ULONG STDMETHODCALLTYPE DT_Release(IDropTarget *t) { (void)t; return 1; }
+static HRESULT STDMETHODCALLTYPE DT_Enter(IDropTarget *t, IDataObject *d, DWORD ks, POINTL pt, DWORD *eff) {
+    (void)t; (void)ks; (void)pt;
+    g_dropOk = d && d->lpVtbl->QueryGetData(d, &g_fmtDrop) == S_OK;
+    *eff = g_dropOk ? DROPEFFECT_COPY : DROPEFFECT_NONE; return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE DT_Over(IDropTarget *t, DWORD ks, POINTL pt, DWORD *eff) {
+    (void)t; (void)ks; (void)pt;
+    *eff = g_dropOk ? DROPEFFECT_COPY : DROPEFFECT_NONE; return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE DT_Leave(IDropTarget *t) { (void)t; return S_OK; }
+static HRESULT STDMETHODCALLTYPE DT_Drop(IDropTarget *t, IDataObject *d, DWORD ks, POINTL pt, DWORD *eff) {
+    STGMEDIUM m;
+    (void)t; (void)ks; (void)pt;
+    *eff = DROPEFFECT_NONE;
+    if (d && SUCCEEDED(d->lpVtbl->GetData(d, &g_fmtDrop, &m))) {
+        HDROP h = (HDROP)GlobalLock(m.hGlobal);
+        if (h) {
+            if (DragQueryFileW(h, 0, g_dropPath, 1024)) { PostMessageW(hMain, WM_APP_DROP, 0, 0); *eff = DROPEFFECT_COPY; }
+            GlobalUnlock(m.hGlobal);
+        }
+        ReleaseStgMedium(&m);
+    }
+    return S_OK;
+}
+static IDropTargetVtbl g_dtVtbl = { DT_QI, DT_AddRef, DT_Release, DT_Enter, DT_Over, DT_Leave, DT_Drop };
+static IDropTarget g_dt = { &g_dtVtbl };
+static HRESULT g_hookHr;
+static void hook_drop(HWND h) { RevokeDragDrop(h); g_hookHr = RegisterDragDrop(h, &g_dt); }
 
 /* ---------- inline Markdown -> RTF ---------- */
 static int skip_code(const wchar_t *s, int i, int n) {
@@ -619,18 +666,68 @@ static void post_sentinels(void) {
     free(pos);
 }
 
+/* ---------- hladanie bez ohladu na velkost pismen a diakritiku ---------- */
+/* Znak sa prevedie na male pismeno bez diakritiky; dlzka textu sa nemeni, takze indexy sedia. */
+static wchar_t fold_ch(wchar_t c) {
+    static wchar_t tab[0x250]; static int init = 0;
+    if (!init) {
+        int i;
+        for (i = 0; i < 0x250; i++) {
+            wchar_t in = (wchar_t)i, out[8], b = (wchar_t)i;
+            if (i >= 0x80) {
+                int k = FoldStringW(MAP_COMPOSITE, &in, 1, out, 8);
+                if (k >= 1 && out[0] && !(out[0] >= 0x300 && out[0] < 0x370)) b = out[0];
+            }
+            if (i == 0xA0) b = ' ';
+            if (i >= 32) CharLowerBuffW(&b, 1);
+            tab[i] = b;
+        }
+        init = 1;
+    }
+    if (c < 0x250) return tab[c];
+    CharLowerBuffW(&c, 1); return c;
+}
+/* text v indexoch RichEditu (1 znak = 1 pozicia, aj v tabulkach) */
+static wchar_t *get_cp_text(HWND h, int *outn) {
+    GETTEXTLENGTHEX gl; GETTEXTEX gt; int n, cap, got; wchar_t *w;
+    gl.flags = GTL_NUMCHARS | GTL_PRECISE; gl.codepage = 1200;
+    n = (int)SendMessageW(h, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0); if (n < 0) n = 0;
+    cap = n * 2 + 65536; w = (wchar_t *)malloc(cap * sizeof(wchar_t));
+    /* GT_RAWTEXT (4): text presne ako v pamati vratane znakov struktury tabuliek */
+    ZeroMemory(&gt, sizeof gt); gt.cb = (DWORD)((cap - 1) * sizeof(wchar_t)); gt.flags = 4; gt.codepage = 1200;
+    got = (int)SendMessageW(h, EM_GETTEXTEX, (WPARAM)&gt, (LPARAM)w);
+    if (got < 0) got = 0; if (got > cap - 1) got = cap - 1;
+    w[got] = 0; *outn = got; return w;
+}
+/* vrati pole zaciatkov vsetkych vyskytov g_find v okne t; dlzka zhody je *mlen */
+static int *find_all(HWND t, int *cnt, int *mlen) {
+    wchar_t nd[256], *s; int m = 0, n, i, cap = 0, c = 0, *r = NULL;
+    for (; g_find[m] && m < 255; m++) nd[m] = fold_ch(g_find[m]);
+    *mlen = m; *cnt = 0;
+    if (!m) return NULL;
+    s = get_cp_text(t, &n);
+    for (i = 0; i < n; i++) s[i] = fold_ch(s[i]);
+    for (i = 0; i + m <= n && c < 20000; i++) {
+        if (s[i] == nd[0] && memcmp(s + i, nd, m * sizeof(wchar_t)) == 0) {
+            if (c == cap) { cap = cap * 2 + 64; r = (int *)realloc(r, cap * sizeof(int)); }
+            r[c++] = i; i += m - 1;
+        }
+    }
+    free(s); *cnt = c; return r;
+}
+
 static void apply_hl(void) {
-    FINDTEXTEXW ft; CHARFORMAT2W cf; int from = 0, cnt = 0;
+    CHARFORMAT2W cf; int cnt, m, i, *hits;
     if (!g_find[0]) return;
+    hits = find_all(hView, &cnt, &m);
     ZeroMemory(&cf, sizeof cf); cf.cbSize = sizeof cf; cf.dwMask = CFM_BACKCOLOR | CFM_COLOR;
     cf.crBackColor = RGB(255, 214, 10); cf.crTextColor = RGB(0, 0, 0);
-    while (cnt < 3000) {
-        ft.chrg.cpMin = from; ft.chrg.cpMax = -1; ft.lpstrText = g_find;
-        if (SendMessageW(hView, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&ft) < 0) break;
-        SendMessageW(hView, EM_EXSETSEL, 0, (LPARAM)&ft.chrgText);
+    for (i = 0; i < cnt && i < 3000; i++) {
+        CHARRANGE cr; cr.cpMin = hits[i]; cr.cpMax = hits[i] + m;
+        SendMessageW(hView, EM_EXSETSEL, 0, (LPARAM)&cr);
         SendMessageW(hView, EM_SETCHARFORMAT, SCF_SELECTION, (LPARAM)&cf);
-        from = ft.chrgText.cpMax > from ? ft.chrgText.cpMax : from + 1; cnt++;
     }
+    free(hits);
 }
 
 /* navod je vlozeny v exe ako RCDATA 1 (subor NAVOD.md, UTF-8) */
@@ -691,6 +788,7 @@ static void render(int resetScroll) {
     apply_hl();
     SendMessageW(hView, EM_EXSETSEL, 0, (LPARAM)&z);
     SendMessageW(hView, EM_SETREADONLY, TRUE, 0);
+    hook_drop(hView);   /* prepnutie read-only meni registraciu drop targetu RichEditu */
     if (!resetScroll) SendMessageW(hView, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
     SendMessageW(hView, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(hView, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
@@ -851,38 +949,26 @@ static void open_link(const wchar_t *url) {
 /* ---------- hladanie ---------- */
 static HWND find_target(void) { return (g_edit && g_lastPane == hEdit) ? hEdit : hView; }
 
-static void update_count(HWND t) {
-    FINDTEXTEXW ft; CHARRANGE sel; int from = 0, cnt = 0, cur = 0; wchar_t s[32] = L"";
-    if (g_find[0]) {
-        SendMessageW(t, EM_EXGETSEL, 0, (LPARAM)&sel);
-        while (cnt < 9999) {
-            ft.chrg.cpMin = from; ft.chrg.cpMax = -1; ft.lpstrText = g_find;
-            if (SendMessageW(t, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&ft) < 0) break;
-            cnt++; if (ft.chrgText.cpMin == sel.cpMin && sel.cpMax > sel.cpMin) cur = cnt;
-            from = ft.chrgText.cpMax > from ? ft.chrgText.cpMax : from + 1;
-        }
-        _snwprintf(s, 31, L"%d / %d", cur, cnt);
-    }
-    SetWindowTextW(hCount, s);
-}
 static void do_find(int dir, int fromStart) {
-    HWND t = find_target(); FINDTEXTEXW ft; CHARRANGE sel; LRESULT r;
-    if (!g_find[0]) { update_count(t); return; }
+    HWND t = find_target(); CHARRANGE sel; int cnt, m, i, idx = -1, *hits; wchar_t s[32];
+    if (!g_find[0]) { SetWindowTextW(hCount, L""); return; }
+    hits = find_all(t, &cnt, &m);
     SendMessageW(t, EM_EXGETSEL, 0, (LPARAM)&sel);
-    ft.lpstrText = g_find;
-    if (dir > 0) {
-        ft.chrg.cpMin = fromStart ? sel.cpMin : sel.cpMax; ft.chrg.cpMax = -1;
-        r = SendMessageW(t, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&ft);
-        if (r < 0) { ft.chrg.cpMin = 0; r = SendMessageW(t, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&ft); }
-    } else {
-        ft.chrg.cpMin = sel.cpMin; ft.chrg.cpMax = 0;
-        r = SendMessageW(t, EM_FINDTEXTEXW, 0, (LPARAM)&ft);
-        if (r < 0) { ft.chrg.cpMin = GetWindowTextLengthW(t) + 1; r = SendMessageW(t, EM_FINDTEXTEXW, 0, (LPARAM)&ft); }
+    if (cnt) {
+        if (dir > 0) {
+            int start = fromStart ? sel.cpMin : sel.cpMax;
+            for (i = 0; i < cnt; i++) if (hits[i] >= start) { idx = i; break; }
+            if (idx < 0) idx = 0;
+        } else {
+            for (i = cnt - 1; i >= 0; i--) if (hits[i] < sel.cpMin) { idx = i; break; }
+            if (idx < 0) idx = cnt - 1;
+        }
     }
-    if (r >= 0) {
-        POINTL p; RECT rc;
-        SendMessageW(t, EM_EXSETSEL, 0, (LPARAM)&ft.chrgText);
-        SendMessageW(t, EM_POSFROMCHAR, (WPARAM)&p, ft.chrgText.cpMin);
+    if (idx >= 0) {
+        POINTL p; RECT rc; CHARRANGE cr;
+        cr.cpMin = hits[idx]; cr.cpMax = hits[idx] + m;
+        SendMessageW(t, EM_EXSETSEL, 0, (LPARAM)&cr);
+        SendMessageW(t, EM_POSFROMCHAR, (WPARAM)&p, cr.cpMin);
         GetClientRect(t, &rc);
         if (p.y < S(4) || p.y > rc.bottom - S(48)) {
             POINT sp; SendMessageW(t, EM_GETSCROLLPOS, 0, (LPARAM)&sp);
@@ -890,7 +976,9 @@ static void do_find(int dir, int fromStart) {
             SendMessageW(t, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
         }
     }
-    update_count(t);
+    _snwprintf(s, 31, L"%d / %d", idx + 1, cnt); s[31] = 0;
+    SetWindowTextW(hCount, s);
+    free(hits);
 }
 static void find_changed(void) {
     CHARRANGE sel;
@@ -918,10 +1006,15 @@ static void layout(void) {
     GetClientRect(hMain, &rc); W = rc.right; H = rc.bottom; by = (tb - bh) / 2; x = S(8);
     for (i = 0; i < 6; i++) { MoveWindow(hBtn[i], x, by, S(bw[i]), bh, TRUE); x += S(bw[i]) + S(6); if (i == 3) x += S(8); }
     MoveWindow(hBtn[8], x + S(8), by, S(68), bh, TRUE);
+    MoveWindow(hBtn[10], x + S(8) + S(68) + S(6), by, S(104), bh, TRUE);
     x = W - S(8) - S(30); MoveWindow(hBtn[7], x, by, S(30), bh, TRUE);
     x -= S(30) + S(4); MoveWindow(hBtn[6], x, by, S(30), bh, TRUE);
     x -= S(70) + S(4); MoveWindow(hCount, x, by + S(6), S(70), bh - S(10), TRUE);
-    x -= S(210) + S(6); MoveWindow(hSearch, x, by + S(4), S(210), bh - S(8), TRUE);
+    x -= S(240) + S(6);
+    SetRect(&g_searchRc, x, by, x + S(240), by + bh);
+    MoveWindow(hSearch, x + S(5), by + S(6), S(240) - S(10) - S(24), bh - S(12), TRUE);
+    MoveWindow(hBtn[9], x + S(240) - S(26), by + S(3), S(23), bh - S(6), TRUE);
+    ShowWindow(hBtn[9], GetWindowTextLengthW(hSearch) ? SW_SHOW : SW_HIDE);
     if (g_edit) {
         int sw = S(6), ew = (int)((W - sw) * g_split);
         MoveWindow(hEdit, 0, tb, ew, H - tb, TRUE); MoveWindow(hView, ew + sw, tb, W - ew - sw, H - tb, TRUE);
@@ -973,6 +1066,127 @@ static void reg_save(void) {
     v = g_dark; RegSetValueExW(k, L"Dark", 0, REG_DWORD, (BYTE *)&v, sizeof v);
     v = g_fs; RegSetValueExW(k, L"FontSize", 0, REG_DWORD, (BYTE *)&v, sizeof v);
     RegCloseKey(k);
+}
+
+/* ---------- aktualizacia z GitHub Releases ----------
+   Najnovsie vydanie: tag "vX.Y" a prilozeny subor s nazvom presne MDView.exe.
+   Kontrola bezi na pozadi; stiahnuty subor sa vymeni za beziace exe a aplikacia sa restartuje. */
+#ifndef APP_VERSION
+#define APP_VERSION "1.1"
+#endif
+#define UPD_API_HOST L"api.github.com"
+#define UPD_API_PATH L"/repos/JurajCyprich/MDView/releases/latest"
+#define UPD_DL_HOST  L"github.com"
+#define UPD_DL_PATH  L"/JurajCyprich/MDView/releases/latest/download/MDView.exe"
+#define UPD_PAGE     L"https://github.com/JurajCyprich/MDView/releases/latest"
+#define WM_APP_UPDCHECK (WM_APP + 2)   /* wParam: 1 = rucna kontrola, lParam: 1 novsia, 0 aktualna, -1 chyba */
+#define WM_APP_UPDDONE  (WM_APP + 3)   /* lParam: 1 = stiahnute */
+static char g_ver[32] = APP_VERSION, g_newVer[32];
+static int g_updBusy, g_updTest;
+static wchar_t g_exe[1024];
+
+static BYTE *http_get(const wchar_t *host, const wchar_t *path, DWORD maxLen, DWORD *outLen) {
+    HINTERNET s = NULL, c = NULL, r = NULL; BYTE *buf = NULL; DWORD n = 0, cap = 0, st = 0, sl = sizeof st; int ok = 0;
+    s = WinHttpOpen(L"MDView-updater", 4 /*WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY*/, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!s) goto end;
+    WinHttpSetTimeouts(s, 8000, 8000, 10000, 30000);
+    c = WinHttpConnect(s, host, INTERNET_DEFAULT_HTTPS_PORT, 0); if (!c) goto end;
+    r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE); if (!r) goto end;
+    if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(r, NULL)) goto end;
+    if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX) || st != 200) goto end;
+    for (;;) {
+        DWORD got = 0;
+        if (n + 65536 + 1 > cap) { cap = cap * 2 + 262144; buf = (BYTE *)realloc(buf, cap); }
+        if (!WinHttpReadData(r, buf + n, 65536, &got)) goto end;
+        if (!got) { ok = 1; break; }
+        n += got; if (n > maxLen) goto end;
+    }
+end:
+    if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c); if (s) WinHttpCloseHandle(s);
+    if (!ok) { free(buf); return NULL; }
+    buf[n] = 0; *outLen = n; return buf;
+}
+/* porovna verzie "1.10.2" / "v1.2"; >0 ak a je novsia */
+static int ver_cmp(const char *a, const char *b) {
+    int i;
+    if (*a == 'v' || *a == 'V') a++; if (*b == 'v' || *b == 'V') b++;
+    for (i = 0; i < 4; i++) {
+        long x = strtol(a, (char **)&a, 10), y = strtol(b, (char **)&b, 10);
+        if (x != y) return x > y ? 1 : -1;
+        if (*a == '.') a++; if (*b == '.') b++;
+    }
+    return 0;
+}
+static DWORD WINAPI upd_check_thread(LPVOID p) {
+    DWORD n; int res = -1; BYTE *b = http_get(UPD_API_HOST, UPD_API_PATH, 1 << 20, &n);
+    if (b) {
+        char *t = strstr((char *)b, "\"tag_name\""), *e;
+        if (t && (t = strchr(t + 10, ':')) != NULL && (t = strchr(t, '"')) != NULL && (e = strchr(++t, '"')) != NULL && e - t < 31) {
+            char v[32]; memcpy(v, t, e - t); v[e - t] = 0;
+            res = ver_cmp(v, g_ver) > 0;
+            if (res) lstrcpynA(g_newVer, (v[0] == 'v' || v[0] == 'V') ? v + 1 : v, 32);
+        }
+        free(b);
+    }
+    PostMessageW(hMain, WM_APP_UPDCHECK, (WPARAM)p, res);
+    return 0;
+}
+static DWORD WINAPI upd_download_thread(LPVOID p) {
+    DWORD n = 0, wr = 0; int ok = 0; BYTE *b = http_get(UPD_DL_HOST, UPD_DL_PATH, 64u << 20, &n);
+    (void)p;
+    if (b && n > 50000 && b[0] == 'M' && b[1] == 'Z') {
+        wchar_t tmp[1100]; HANDLE h;
+        _snwprintf(tmp, 1099, L"%s.new", g_exe); tmp[1099] = 0;
+        h = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE) { ok = WriteFile(h, b, n, &wr, NULL) && wr == n; CloseHandle(h); if (!ok) DeleteFileW(tmp); }
+    }
+    free(b);
+    PostMessageW(hMain, WM_APP_UPDDONE, 0, ok);
+    return 0;
+}
+static void upd_check(int manual) {
+    HANDLE t;
+    if (g_updBusy) return;
+    g_updBusy = 1;
+    t = CreateThread(NULL, 0, upd_check_thread, (LPVOID)(INT_PTR)manual, 0, NULL);
+    if (t) CloseHandle(t); else g_updBusy = 0;
+}
+static void upd_button(const wchar_t *text, int enabled) {
+    SetWindowTextW(hBtn[10], text); EnableWindow(hBtn[10], enabled);
+    ShowWindow(hBtn[10], SW_SHOW); InvalidateRect(hBtn[10], NULL, TRUE);
+}
+static void upd_ask(void) {
+    wchar_t m[300]; HANDLE t;
+    if (g_updBusy || !g_newVer[0]) return;
+    _snwprintf(m, 299, L"Je dostupná nová verzia %S (máte %S).\n\nStiahnuť a nainštalovať ju teraz? Aplikácia sa potom sama reštartuje.", g_newVer, g_ver); m[299] = 0;
+    if (!g_updTest && MessageBoxW(hMain, m, APP, MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    g_updBusy = 1; upd_button(L"Sťahujem\x2026", FALSE);
+    t = CreateThread(NULL, 0, upd_download_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t); else { g_updBusy = 0; upd_button(L"Aktualizovať", TRUE); }
+}
+/* vymeni beziace exe za stiahnute a spusti ho; vrati 0 pri chybe */
+static int upd_apply(void) {
+    wchar_t nw[1100], old[1100], cmd[2400]; STARTUPINFOW si; PROCESS_INFORMATION pi;
+    _snwprintf(nw, 1099, L"%s.new", g_exe); nw[1099] = 0;
+    _snwprintf(old, 1099, L"%s.old", g_exe); old[1099] = 0;
+    if (!confirm_discard()) { DeleteFileW(nw); return -1; }
+    DeleteFileW(old);
+    if (!MoveFileExW(g_exe, old, MOVEFILE_REPLACE_EXISTING)) { DeleteFileW(nw); return 0; }
+    if (!MoveFileExW(nw, g_exe, MOVEFILE_REPLACE_EXISTING)) { MoveFileExW(old, g_exe, MOVEFILE_REPLACE_EXISTING); DeleteFileW(nw); return 0; }
+    if (g_updTest) return 1;
+    if (g_path[0]) _snwprintf(cmd, 2399, L"\"%s\" \"%s\"", g_exe, g_path); else _snwprintf(cmd, 2399, L"\"%s\"", g_exe);
+    cmd[2399] = 0;
+    ZeroMemory(&si, sizeof si); si.cb = sizeof si;
+    if (CreateProcessW(g_exe, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    g_modified = 0; DestroyWindow(hMain);
+    return 1;
+}
+static void upd_startup(void) {
+    wchar_t old[1100];
+    GetModuleFileNameW(NULL, g_exe, 1024);
+    _snwprintf(old, 1099, L"%s.old", g_exe); old[1099] = 0;
+    DeleteFileW(old);              /* zvysok po predoslej aktualizacii */
+    upd_check(0);
 }
 
 /* ---------- subclassy ---------- */
@@ -1035,7 +1249,7 @@ static HWND make_rich(HWND parent, int id, DWORD extra) {
     HWND h = CreateWindowExW(0, L"RICHEDIT50W", L"", WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_CLIPSIBLINGS |
         ES_MULTILINE | ES_AUTOVSCROLL | ES_NOHIDESEL | ES_DISABLENOSCROLL | extra, 0, 0, 10, 10, parent, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
     SendMessageW(h, EM_EXLIMITTEXT, 0, 0x7FFFFFF0);
-    RevokeDragDrop(h); DragAcceptFiles(h, TRUE);
+    hook_drop(h);
     g_reProc = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)ReProc);
     return h;
 }
@@ -1044,20 +1258,20 @@ static HWND make_rich(HWND parent, int id, DWORD extra) {
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_CREATE: {
-        static const struct { int id; const wchar_t *t; } bt[9] = {
+        static const struct { int id; const wchar_t *t; } bt[11] = {
             { ID_OPEN, L"Otvoriť" }, { ID_SAVE, L"Uložiť" }, { ID_EDIT, L"Upraviť" }, { ID_THEME, L"Tmavý" },
-            { ID_ZOOMOUT, L"A\x2212" }, { ID_ZOOMIN, L"A+" }, { ID_PREV, L"\x2039" }, { ID_NEXT, L"\x203A" }, { ID_HELP, L"Návod" } };
+            { ID_ZOOMOUT, L"A\x2212" }, { ID_ZOOMIN, L"A+" }, { ID_PREV, L"\x2039" }, { ID_NEXT, L"\x203A" }, { ID_HELP, L"Návod" }, { ID_CLEAR, L"\x2715" }, { ID_UPDATE, L"Aktualizovať" } };
         int i; HINSTANCE hi = GetModuleHandleW(NULL);
         hMain = h;
         hUiFont = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-        for (i = 0; i < 9; i++) {
-            hBtn[i] = CreateWindowExW(0, L"BUTTON", bt[i].t, WS_CHILD | WS_VISIBLE | BS_OWNERDRAW, 0, 0, 10, 10, h, (HMENU)(INT_PTR)bt[i].id, hi, NULL);
+        for (i = 0; i < 11; i++) {
+            hBtn[i] = CreateWindowExW(0, L"BUTTON", bt[i].t, WS_CHILD | (i == 10 ? 0 : WS_VISIBLE) | BS_OWNERDRAW, 0, 0, 10, 10, h, (HMENU)(INT_PTR)bt[i].id, hi, NULL);
             SendMessageW(hBtn[i], WM_SETFONT, (WPARAM)hUiFont, 0);
         }
         hSearch = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, 0, 0, 10, 10, h, (HMENU)IDC_SEARCH, hi, NULL);
         SendMessageW(hSearch, WM_SETFONT, (WPARAM)hUiFont, 0);
-        SendMessageW(hSearch, EM_SETCUEBANNER, TRUE, (LPARAM)L"Hľadať  (Ctrl+F)");
-        SendMessageW(hSearch, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(6), S(6)));
+        SendMessageW(hSearch, EM_SETCUEBANNER, FALSE, (LPARAM)L"Hľadať  (Ctrl+F)");
+        SendMessageW(hSearch, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(S(3), S(3)));
         SendMessageW(hSearch, EM_LIMITTEXT, 250, 0);
         g_edProc = (WNDPROC)SetWindowLongPtrW(hSearch, GWLP_WNDPROC, (LONG_PTR)SearchProc);
         hCount = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_CENTER, 0, 0, 10, 10, h, (HMENU)IDC_COUNT, hi, NULL);
@@ -1068,7 +1282,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         hView = make_rich(h, IDC_VIEW, ES_READONLY);
         SendMessageW(hView, EM_SETUNDOLIMIT, 0, 0);
         g_lastPane = hView;
-        DragAcceptFiles(h, TRUE);
+        hook_drop(h);
         layout();
         apply_theme();
         set_title();
@@ -1080,19 +1294,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             g_lastViewW = r.right;
         }
         return 0;
-    case WM_GETMINMAXINFO: { MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(900); mm->ptMinTrackSize.y = S(300); return 0; }
-    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)wp, &rc, hbrBar); return 1; }
+    case WM_GETMINMAXINFO: { MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(960); mm->ptMinTrackSize.y = S(300); return 0; }
+    case WM_ERASEBKGND: {
+        RECT rc; HDC dc = (HDC)wp; HPEN pen; HGDIOBJ ob, op; int foc = (GetFocus() == hSearch);
+        GetClientRect(h, &rc); FillRect(dc, &rc, hbrBar);
+        pen = CreatePen(PS_SOLID, foc ? S(2) : 1, foc ? T.accent : T.border);
+        ob = SelectObject(dc, hbrEdit); op = SelectObject(dc, pen);
+        RoundRect(dc, g_searchRc.left, g_searchRc.top, g_searchRc.right, g_searchRc.bottom, S(7), S(7));
+        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(pen);
+        return 1; }
     case WM_SETFOCUS: if (g_lastPane) SetFocus(g_lastPane); return 0;
     case WM_CTLCOLOREDIT:
         SetTextColor((HDC)wp, T.text); SetBkColor((HDC)wp, T.editBg); return (LRESULT)hbrEdit;
     case WM_CTLCOLORSTATIC:
         SetTextColor((HDC)wp, T.muted); SetBkColor((HDC)wp, T.bar); return (LRESULT)hbrBar;
     case WM_DRAWITEM: {
-        DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT *)lp; wchar_t t[32]; int on = (d->CtlID == ID_EDIT && g_edit) || (d->CtlID == ID_HELP && g_help);
-        COLORREF bg = (d->itemState & ODS_SELECTED) ? T.btnDown : on ? T.accent : T.btn;
-        HBRUSH br = CreateSolidBrush(bg); HPEN pen = CreatePen(PS_SOLID, 1, on ? T.accent : T.border);
+        DRAWITEMSTRUCT *d = (DRAWITEMSTRUCT *)lp; wchar_t t[32]; int on = (d->CtlID == ID_EDIT && g_edit) || (d->CtlID == ID_HELP && g_help) || d->CtlID == ID_UPDATE;
+        int flat = (d->CtlID == ID_CLEAR);   /* krizik lezi vnutri hladacieho pola */
+        COLORREF bg = (d->itemState & ODS_SELECTED) ? T.btnDown : on ? T.accent : flat ? T.editBg : T.btn;
+        HBRUSH br = CreateSolidBrush(bg); HPEN pen = CreatePen(PS_SOLID, 1, on ? T.accent : flat ? bg : T.border);
         HGDIOBJ ob, op;
-        FillRect(d->hDC, &d->rcItem, hbrBar);
+        FillRect(d->hDC, &d->rcItem, flat ? hbrEdit : hbrBar);
         ob = SelectObject(d->hDC, br); op = SelectObject(d->hDC, pen);
         RoundRect(d->hDC, d->rcItem.left, d->rcItem.top, d->rcItem.right, d->rcItem.bottom, S(7), S(7));
         SelectObject(d->hDC, ob); SelectObject(d->hDC, op); DeleteObject(br); DeleteObject(pen);
@@ -1126,6 +1348,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (wp == T_RENDER || wp == T_RESIZE) render(0);
         else if (wp == T_FIND) find_changed();
         return 0;
+    case WM_APP_UPDCHECK:
+        g_updBusy = 0;
+        if (lp == 1) { upd_button(L"Aktualizovať", TRUE); if (wp || g_updTest) upd_ask(); }
+        else if (wp) {
+            wchar_t m[200];
+            if (lp == 0) { _snwprintf(m, 199, L"Máte najnovšiu verziu (%S).", g_ver); m[199] = 0; MessageBoxW(h, m, APP, MB_ICONINFORMATION); }
+            else MessageBoxW(h, L"Nepodarilo sa overiť novú verziu. Skontrolujte pripojenie na internet.", APP, MB_ICONWARNING);
+        }
+        return 0;
+    case WM_APP_UPDDONE: {
+        int r = lp ? upd_apply() : 0;
+        g_updBusy = 0;
+        if (r == 1) return 0;
+        upd_button(L"Aktualizovať", TRUE);
+        if (r == 0 && !g_updTest && MessageBoxW(h, L"Aktualizáciu sa nepodarilo stiahnuť alebo nainštalovať.\n(Priečinok s aplikáciou musí byť zapisovateľný.)\n\nOtvoriť stránku na ručné stiahnutie?", APP, MB_YESNO | MB_ICONWARNING) == IDYES)
+            ShellExecuteW(h, L"open", UPD_PAGE, NULL, NULL, SW_SHOWNORMAL);
+        return 0; }
+    case WM_APP_DROP:
+        SetForegroundWindow(h);
+        if (confirm_discard()) { wchar_t p[1024]; wcscpy(p, g_dropPath); load_file(p); }
+        return 0;
     case WM_DROPFILES: {
         wchar_t path[1024]; HDROP d = (HDROP)wp;
         if (DragQueryFileW(d, 0, path, 1024)) { DragFinish(d); SetForegroundWindow(h); if (confirm_discard()) load_file(path); }
@@ -1134,13 +1377,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
         if (id == IDC_EDITOR) { if (code == EN_CHANGE && !g_loading) { set_modified(1); SetTimer(h, T_RENDER, 250, NULL); } return 0; }
-        if (id == IDC_SEARCH) { if (code == EN_CHANGE) SetTimer(h, T_FIND, 200, NULL); return 0; }
+        if (id == IDC_SEARCH) {
+            if (code == EN_CHANGE) { SetTimer(h, T_FIND, 200, NULL); ShowWindow(hBtn[9], GetWindowTextLengthW(hSearch) ? SW_SHOW : SW_HIDE); }
+            else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) InvalidateRect(h, &g_searchRc, TRUE);
+            return 0;
+        }
         if (id == IDC_VIEW || id == IDC_COUNT) return 0;
         switch (id) {
         case ID_OPEN: do_open(); break;
         case ID_SAVE: do_save(0); break;
         case ID_SAVEAS: do_save(1); break;
         case ID_HELP: set_help(!g_help); break;
+        case ID_UPDATE: upd_ask(); break;
+        case ID_UPDCHECK: upd_check(1); break;
         case ID_NEW: if (confirm_discard()) { g_help = 0; InvalidateRect(hBtn[8], NULL, TRUE); g_path[0] = 0; set_editor_text(L""); g_modified = 0; set_title(); render(1); if (!g_edit) set_edit_mode(1); } return 0;
         case ID_RELOAD: if (g_path[0] && confirm_discard()) { wchar_t p[1024]; wcscpy(p, g_path); load_file(p); } break;
         case ID_EDIT: set_edit_mode(!g_edit); return 0;
@@ -1154,8 +1403,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             { wchar_t cur[256]; GetWindowTextW(hSearch, cur, 255); if (wcscmp(cur, g_find)) find_changed(); else do_find(id == ID_NEXT ? 1 : -1, 0); }
             if (GetFocus() == hSearch) return 0;
             break;
-        case ID_ESC:
-            if (g_find[0] || GetWindowTextLengthW(hSearch) || GetFocus() == hSearch) {
+        case ID_ESC: case ID_CLEAR:
+            if (id == ID_CLEAR || g_find[0] || GetWindowTextLengthW(hSearch) || GetFocus() == hSearch) {
                 KillTimer(h, T_FIND); SetWindowTextW(hSearch, L""); KillTimer(h, T_FIND);
                 if (g_find[0]) { g_find[0] = 0; render(0); }
                 SetWindowTextW(hCount, L"");
@@ -1175,7 +1424,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     static ACCEL acc[] = {
         { FCONTROL | FVIRTKEY, 'O', ID_OPEN }, { FCONTROL | FVIRTKEY, 'S', ID_SAVE }, { FCONTROL | FSHIFT | FVIRTKEY, 'S', ID_SAVEAS },
         { FCONTROL | FVIRTKEY, 'E', ID_EDIT }, { FCONTROL | FVIRTKEY, 'D', ID_THEME }, { FCONTROL | FVIRTKEY, 'F', ID_FIND },
-        { FCONTROL | FVIRTKEY, 'N', ID_NEW }, { FVIRTKEY, VK_F5, ID_RELOAD }, { FVIRTKEY, VK_F1, ID_HELP },
+        { FCONTROL | FVIRTKEY, 'N', ID_NEW }, { FVIRTKEY, VK_F5, ID_RELOAD }, { FVIRTKEY, VK_F1, ID_HELP }, { FCONTROL | FVIRTKEY, 'U', ID_UPDCHECK },
         { FVIRTKEY, VK_F3, ID_NEXT }, { FSHIFT | FVIRTKEY, VK_F3, ID_PREV }, { FVIRTKEY, VK_ESCAPE, ID_ESC },
         { FCONTROL | FVIRTKEY, VK_OEM_PLUS, ID_ZOOMIN }, { FCONTROL | FVIRTKEY, VK_ADD, ID_ZOOMIN },
         { FCONTROL | FVIRTKEY, VK_OEM_MINUS, ID_ZOOMOUT }, { FCONTROL | FVIRTKEY, VK_SUBTRACT, ID_ZOOMOUT },
@@ -1191,12 +1440,54 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     T = g_dark ? DARK : LIGHT; hbrBar = CreateSolidBrush(T.bar); hbrEdit = CreateSolidBrush(T.editBg);
 
     ZeroMemory(&wc, sizeof wc); wc.cbSize = sizeof wc; wc.lpfnWndProc = WndProc; wc.hInstance = hi;
-    wc.hCursor = LoadCursorW(NULL, IDC_ARROW); wc.hIcon = LoadIconW(NULL, IDI_APPLICATION); wc.lpszClassName = L"MDViewMain";
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW); wc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
+    wc.hIconSm = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
+    wc.lpszClassName = L"MDViewMain";
     RegisterClassExW(&wc);
     CreateWindowExW(0, L"MDViewMain", APP, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, S(1100), S(780), NULL, NULL, hi, NULL);
     if (!hMain) return 1;
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     if (argv && argc > 1) load_file(argv[1]);
+#ifdef MDV_TEST
+    if (_wgetenv(L"MDV_TEST_VER")) { WideCharToMultiByte(CP_ACP, 0, _wgetenv(L"MDV_TEST_VER"), -1, g_ver, 31, NULL, NULL); g_updTest = 1; }
+#endif
+    upd_startup();
+#ifdef MDV_TEST
+    {   /* samotest: indexy hladania a drop target (len v testovacom builde) */
+        wchar_t *out = _wgetenv(L"MDV_TEST_OUT"), *dropf = _wgetenv(L"MDV_TEST_DROP");
+        if (out) {
+            FILE *f = _wfopen(out, L"w"); int cnt, m, from = 0, fc = 0, bad = 0, k, *hh; FINDTEXTEXW ft; HRESULT hv, hm;
+            wcscpy(g_find, L"sa"); hh = find_all(hView, &cnt, &m);
+            for (;;) {
+                int found = 0;
+                ft.chrg.cpMin = from; ft.chrg.cpMax = -1; ft.lpstrText = L"sa";
+                if (SendMessageW(hView, EM_FINDTEXTEXW, FR_DOWN, (LPARAM)&ft) < 0) break;
+                fc++; for (k = 0; k < cnt; k++) if (hh[k] == ft.chrgText.cpMin) { found = 1; break; }
+                if (!found) bad++;
+                from = ft.chrgText.cpMax;
+            }
+            fprintf(f, "search: mine=%d richedit=%d missing=%d\n", cnt, fc, bad);
+            wcscpy(g_find, L"citanie"); free(hh); hh = find_all(hView, &cnt, &m); fprintf(f, "fold 'citanie' hits=%d\n", cnt); free(hh);
+            g_find[0] = 0;
+            hook_drop(hView); hv = g_hookHr; hook_drop(hMain); hm = g_hookHr;
+            fprintf(f, "register view=0x%lx main=0x%lx\n", (unsigned long)hv, (unsigned long)hm);
+            if (dropf) {
+                IShellItem *it; IDataObject *d; POINTL p = { 0, 0 }; DWORD e = DROPEFFECT_COPY;
+                if (SUCCEEDED(SHCreateItemFromParsingName(dropf, NULL, &IID_IShellItem, (void **)&it)) &&
+                    SUCCEEDED(it->lpVtbl->BindToHandler(it, NULL, &BHID_DataObject, &IID_IDataObject, (void **)&d))) {
+                    g_dt.lpVtbl->DragEnter(&g_dt, d, 0, p, &e); fprintf(f, "enter effect=%lu\n", (unsigned long)e);
+                    e = DROPEFFECT_COPY; g_dt.lpVtbl->Drop(&g_dt, d, 0, p, &e);
+                    fprintf(f, "drop effect=%lu path=%ls\n", (unsigned long)e, g_dropPath);
+                } else fprintf(f, "data object failed\n");
+            }
+            fclose(f);
+        }
+        if (_wgetenv(L"MDV_TEST_FIND")) {   /* predvyplni hladanie a skoci na 2. vyskyt */
+            SetWindowTextW(hSearch, _wgetenv(L"MDV_TEST_FIND")); KillTimer(hMain, T_FIND);
+            ShowWindow(hBtn[9], SW_SHOW); find_changed(); do_find(1, 0);
+        }
+    }
+#endif
     ShowWindow(hMain, show); UpdateWindow(hMain);
     ha = CreateAcceleratorTableW(acc, sizeof acc / sizeof acc[0]);
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

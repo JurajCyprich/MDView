@@ -1,2 +1,4 @@
+// Ikona programu
+1 ICON "mdview.ico"
 // Navod vlozeny do exe ako surove data (UTF-8)
 1 RCDATA "NAVOD.md"

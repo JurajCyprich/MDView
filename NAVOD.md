@@ -9,6 +9,7 @@ Tento návod zatvoríte klávesom `F1`, `Esc` alebo tlačidlom **Návod**.
 - [Hľadanie](#hľadanie)
 - [Úprava dokumentu](#úprava-dokumentu)
 - [Svetlý a tmavý režim, veľkosť písma](#svetlý-a-tmavý-režim-veľkosť-písma)
+- [Aktualizácie](#aktualizácie)
 - [Prehľad klávesových skratiek](#prehľad-klávesových-skratiek)
 - [Čo aplikácia zobrazí](#čo-aplikácia-zobrazí)
 - [Ako to funguje vo vnútri](#ako-to-funguje-vo-vnútri)
@@ -40,7 +41,9 @@ Kliknutie na odkaz:
 1. Stlačte `Ctrl+F` a napíšte hľadaný text.
 2. Všetky výskyty sa zvýraznia žltou a vedľa poľa sa ukáže počítadlo, napríklad `2 / 7`.
 3. `Enter` alebo `F3` skočí na ďalší výskyt, `Shift+F3` na predošlý.
-4. `Esc` hľadanie zruší a zvýraznenie zmizne.
+4. `Esc` alebo krížik **✕** v poli hľadanie zruší a zvýraznenie zmizne.
+
+Hľadanie nerozlišuje veľké a malé písmená ani diakritiku — `klavesovych` nájde aj „Klávesových".
 
 Hľadá sa v náhľade. Ak máte zapnutý editor a kurzor je v ňom, hľadá sa v editore.
 
@@ -61,6 +64,18 @@ Tlačidlo **Tmavý** / **Svetlý** alebo `Ctrl+D` prepína farebný režim. Tla�
 
 Obe nastavenia si aplikácia pamätá do ďalšieho spustenia.
 
+## Aktualizácie
+
+Pri každom spustení si aplikácia na pozadí overí, či na GitHube nevyšla novšia verzia. Ak áno, v hornom paneli sa objaví modré tlačidlo **Aktualizovať**.
+
+1. Kliknite na **Aktualizovať** a potvrďte otázku.
+2. Nová verzia sa stiahne a nahradí súbor `MDView.exe`.
+3. Aplikácia sa sama reštartuje a znova otvorí rozčítaný dokument.
+
+Kontrolu spustíte aj ručne skratkou `Ctrl+U` — vtedy aplikácia oznámi aj to, že máte najnovšiu verziu.
+
+Aktualizácia potrebuje pripojenie na internet a `MDView.exe` musí byť v priečinku, do ktorého možno zapisovať. Bez internetu aplikácia funguje normálne ďalej.
+
 ## Prehľad klávesových skratiek
 
 | Skratka | Akcia |
@@ -77,6 +92,7 @@ Obe nastavenia si aplikácia pamätá do ďalšieho spustenia.
 | `Ctrl+C` | Kopírovať označený text |
 | `Ctrl+A` | Označiť všetko |
 | `Ctrl +` / `Ctrl −` / `Ctrl+0` | Väčšie / menšie / pôvodné písmo |
+| `Ctrl+U` | Skontrolovať aktualizácie |
 | `F1` | Tento návod |
 | `Esc` | Zrušiť hľadanie, zavrieť návod |
 

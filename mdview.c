@@ -37,6 +37,7 @@ enum { T_RENDER = 1, T_RESIZE, T_FIND };
 #define S_LINK_B 0xE001
 #define S_HEAD   0xE002
 #define S_BREAK  0xE003
+#define S_BLOCK  0xE004   /* zaciatok bloku; nesie zdrojovy riadok pre synchronizaciu */
 
 typedef struct { COLORREF bg, text, link, codebg, border, thbg, muted, codefg,
                  bar, barText, btn, btnDown, accent, editBg; } Theme;
@@ -50,6 +51,12 @@ static Theme T;
 
 typedef struct { int a, b; wchar_t *url; } Link;
 typedef struct { int pos; wchar_t slug[128]; } Head;
+typedef struct { int line, cp; } Blk;   /* blok nahladu: zdrojovy riadok -> pozicia v nahlade */
+static Blk *g_blk; static int g_nblk, g_capblk;
+static int *g_lineStart, g_nLines, g_viewLen;   /* zaciatky riadkov v editore (cp) */
+static const wchar_t *g_srcBase;                /* zdrojovy text pocas vykreslovania */
+static int g_syncing, g_lastSy[2];              /* synchronizacia posuvania editor <-> nahlad */
+static void sync_mark(void);
 
 static HWND hMain, hEdit, hView, hSearch, hCount, hBtn[11];
 static RECT g_searchRc;  /* ramcek okolo hladacieho pola */
@@ -428,6 +435,18 @@ static void emit_rule(SB *b, int li) {
     sb_f(b, "\\trowd\\trgaph0\\trrh-20\\trleft%d\\clcbpat4\\cellx%d\\pard\\intbl\\plain\\f0\\fs2\\cf1\\cell\\row\\pard\\plain\\f0\\fs8\\par\n", li, right);
 }
 
+static int src_line(const wchar_t *p) {
+    int off = (int)(p - g_srcBase), lo = 0, hi = g_nLines - 1;
+    while (lo < hi) { int mid = (lo + hi + 1) / 2; if (g_lineStart[mid] <= off) lo = mid; else hi = mid - 1; }
+    return lo;
+}
+static void emit_blk(SB *b, const wchar_t *p) {
+    if (!g_srcBase || g_nLines <= 0) return;
+    if (g_nblk == g_capblk) { g_capblk = g_capblk * 2 + 64; g_blk = (Blk *)realloc(g_blk, g_capblk * sizeof(Blk)); }
+    g_blk[g_nblk].line = src_line(p); g_blk[g_nblk].cp = -1; g_nblk++;
+    sb_f(b, "\\u%d?", (int)(short)S_BLOCK);
+}
+
 #define MAXC 48
 static int split_cells(const wchar_t *s, int n, int *st, int *en, int max) {
     int a = 0, b = n, c = 0, cs, i;
@@ -518,6 +537,7 @@ static void emit_table(SB *b, Line *L, int i0, int i1, int li) {
         for (c = 0; c < nc; c++) { x += wd[c]; sb_s(b, cellb); if (hdr) sb_s(b, "\\clcbpat5"); sb_f(b, "\\cellx%d", x); }
         for (c = 0; c < nc; c++) {
             sb_f(b, "\\pard\\intbl\\%s\\sl276\\slmult1{\\plain\\f0\\fs%d\\cf1 %s", al[c] == 1 ? "qc" : al[c] == 2 ? "qr" : "ql", g_fs, hdr ? "\\b " : "");
+            if (c == 0) emit_blk(b, L[r].s);
             if (c < k) inl(b, L[r].s + cs[c], ce[c] - cs[c]);
             sb_s(b, "}\\cell ");
         }
@@ -553,6 +573,7 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
                 int q = 0, strip = foff;
                 if (ln_fence_close(L[j], fc, fk)) break;
                 if (!first) sb_s(b, "\\par "); first = 0;
+                emit_blk(b, L[j].s);
                 while (q < L[j].len && strip > 0 && is_sp(L[j].s[q])) { q++; strip--; }
                 for (; q < L[j].len; q++) { if (L[j].s[q] == '\t') sb_s(b, "    "); else sb_wc(b, L[j].s[q]); }
             }
@@ -570,6 +591,7 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
             g_heads[g_nheads].pos = -1; make_slug(l.s + a, e - a, g_heads[g_nheads].slug, 128); g_nheads++;
             sb_f(b, "\\pard\\plain\\f0\\b\\fs%d\\cf%d\\li%d\\sb%d\\sa%d\\keepn \\u%d?", FS(hs[h - 1]), cf, li,
                  h <= 2 ? FS(280) : FS(220), h <= 2 ? FS(60) : FS(110), (int)(short)S_HEAD);
+            emit_blk(b, l.s);
             inl(b, l.s + a, e - a);
             sb_s(b, "\\par\n");
             if (h <= 2) emit_rule(b, li);
@@ -604,6 +626,7 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
             hang = it.ordered ? FS(460) : FS(320);
             lii = li + FS(160) + level * FS(380) + hang;
             sb_f(b, "\\pard\\plain\\f0\\fs%d\\cf%d\\sl276\\slmult1\\fi-%d\\li%d\\tx%d\\sa%d ", g_fs, cf, hang, lii, lii, nextList ? FS(50) : FS(160));
+            emit_blk(b, l.s);
             for (k = 0; mk[k]; k++) sb_wc(b, mk[k]);
             sb_s(b, "\\tab ");
             inl(b, w.p + a, w.n - a);
@@ -622,6 +645,7 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
             while (j < n && !ln_blank(L[j]) && !starts_block(L[j]) && !table_at(L, j, n));
             para_trim(&w);
             sb_f(b, "\\pard\\plain\\f0\\fs%d\\cf%d\\sl276\\slmult1\\li%d\\sa%d ", g_fs, cf, li, FS(160));
+            emit_blk(b, L[i].s);
             inl(b, w.p, w.n);
             sb_s(b, "\\par\n");
             i = j;
@@ -638,10 +662,11 @@ typedef struct { int pos; wchar_t c; } SPos;
 static int spos_cmp(const void *a, const void *b) { return ((const SPos *)a)->pos - ((const SPos *)b)->pos; }
 static void post_sentinels(void) {
     /* pozicie hladame cez EM_FINDTEXTEX, aby sedeli s indexmi RichEditu aj v tabulkach */
-    int i, k, removed = 0, li_ = 0, hi_ = 0, np = 0, cap = 0; SPos *pos = NULL;
-    for (k = 0; k < 3; k++) {
+    static const wchar_t sent[4] = { S_LINK_A, S_LINK_B, S_HEAD, S_BLOCK };
+    int i, k, removed = 0, li_ = 0, hi_ = 0, bi_ = 0, np = 0, cap = 0; SPos *pos = NULL;
+    for (k = 0; k < 4; k++) {
         wchar_t needle[2]; FINDTEXTEXW ft; int from = 0;
-        needle[0] = (wchar_t)(S_LINK_A + k); needle[1] = 0;
+        needle[0] = sent[k]; needle[1] = 0;
         for (;;) {
             ft.chrg.cpMin = from; ft.chrg.cpMax = -1; ft.lpstrText = needle;
             if (SendMessageW(hView, EM_FINDTEXTEXW, FR_DOWN | FR_MATCHCASE, (LPARAM)&ft) < 0) break;
@@ -655,6 +680,7 @@ static void post_sentinels(void) {
         int p = pos[i].pos - removed; wchar_t c = pos[i].c;
         if (c == S_LINK_A) { if (li_ < g_nlinks) g_links[li_].a = p; }
         else if (c == S_LINK_B) { if (li_ < g_nlinks) g_links[li_++].b = p; }
+        else if (c == S_BLOCK) { if (bi_ < g_nblk) g_blk[bi_++].cp = p; }
         else if (hi_ < g_nheads) g_heads[hi_++].pos = p;
         removed++;
     }
@@ -751,12 +777,14 @@ static void set_help(int on) {
 static void render(int resetScroll) {
     int n, i, nl = 0, cap = 0; wchar_t *src; Line *L = NULL; SB b = { 0 };
     POINT sp = { 0, 0 }; SETTEXTEX st; CHARRANGE z = { 0, 0 }; CHARFORMAT2W cf;
-    COLORREF cols[7];
+    COLORREF cols[7]; int fromEd;
 
+    g_syncing++;
     src = g_help ? load_help(&n) : NULL;
+    fromEd = (src == NULL);
     if (!src) src = get_text(hEdit, 0, &n);
-    if (!g_help && n == 0 && !g_path[0] && !g_modified) { free(src); src = _wcsdup(WELCOME); n = (int)wcslen(src); }
-    for (i = 0; i < n; i++) if (src[i] >= S_LINK_A && src[i] <= S_BREAK) src[i] = 0xFFFD;
+    if (!g_help && n == 0 && !g_path[0] && !g_modified) { free(src); src = _wcsdup(WELCOME); n = (int)wcslen(src); fromEd = 0; }
+    for (i = 0; i < n; i++) if (src[i] >= S_LINK_A && src[i] <= S_BLOCK) src[i] = 0xFFFD;
     for (i = 0; i <= n; ) {
         int s0 = i;
         while (i < n && src[i] != '\r' && src[i] != '\n') i++;
@@ -767,13 +795,22 @@ static void render(int resetScroll) {
         i++;
     }
     for (i = 0; i < g_nlinks; i++) free(g_links[i].url);
-    g_nlinks = 0; g_nheads = 0; g_hasTable = 0; g_inLink = 0;
+    g_nlinks = 0; g_nheads = 0; g_hasTable = 0; g_inLink = 0; g_nblk = 0;
+    /* editor ma oddelovac riadkov '\r' (1 znak), takze posun v src = pozicia v editore */
+    g_nLines = 0;
+    if (fromEd) {
+        g_lineStart = (int *)realloc(g_lineStart, (nl + 1) * sizeof(int));
+        for (i = 0; i < nl; i++) g_lineStart[i] = (int)(L[i].s - src);
+        g_nLines = nl;
+    }
+    g_srcBase = fromEd ? src : NULL;
 
     sb_s(&b, "{\\rtf1\\ansi\\deff0{\\fonttbl{\\f0\\fswiss Segoe UI;}{\\f1\\fmodern Consolas;}}{\\colortbl ;");
     cols[0] = T.text; cols[1] = T.link; cols[2] = T.codebg; cols[3] = T.border; cols[4] = T.thbg; cols[5] = T.muted; cols[6] = T.codefg;
     for (i = 0; i < 7; i++) rtf_color(&b, cols[i]);
     sb_s(&b, "}\\uc1 ");
     blocks(&b, L, nl, 0, 0);
+    g_srcBase = NULL;
     sb_s(&b, "}");
 
     SendMessageW(hView, EM_GETSCROLLPOS, 0, (LPARAM)&sp);
@@ -785,6 +822,8 @@ static void render(int resetScroll) {
     st.flags = ST_DEFAULT; st.codepage = CP_ACP;
     SendMessageW(hView, EM_SETTEXTEX, (WPARAM)&st, (LPARAM)b.p);
     post_sentinels();
+    { GETTEXTLENGTHEX gl; gl.flags = GTL_NUMCHARS | GTL_PRECISE; gl.codepage = 1200;
+      g_viewLen = (int)SendMessageW(hView, EM_GETTEXTLENGTHEX, (WPARAM)&gl, 0); }
     apply_hl();
     SendMessageW(hView, EM_EXSETSEL, 0, (LPARAM)&z);
     SendMessageW(hView, EM_SETREADONLY, TRUE, 0);
@@ -793,6 +832,8 @@ static void render(int resetScroll) {
     SendMessageW(hView, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(hView, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME);
     free(b.p); free(L); free(src);
+    g_syncing--;
+    sync_mark();
 }
 
 /* ---------- subor ---------- */
@@ -989,6 +1030,99 @@ static void find_changed(void) {
     do_find(1, 1);
 }
 
+/* ---------- synchronizacia editor <-> nahlad ----------
+   Pri vykresleni sa na zaciatok kazdeho bloku vlozi znacka so zdrojovym riadkom (g_blk).
+   Medzi blokmi sa poloha interpoluje podla zvislej pozicie, takze posuvanie je plynule.
+   Volania idu priamo do povodnej procedury RichEditu, aby ich nezachytil nas subclass. */
+static int sc_top(HWND h) { RECT r; CallWindowProcW(g_reProc, h, EM_GETRECT, 0, (LPARAM)&r); return r.top; }
+static int sc_get(HWND h) { POINT sp = { 0, 0 }; CallWindowProcW(g_reProc, h, EM_GETSCROLLPOS, 0, (LPARAM)&sp); return sp.y; }
+static void sc_set(HWND h, double y) {
+    POINT sp; CallWindowProcW(g_reProc, h, EM_GETSCROLLPOS, 0, (LPARAM)&sp);
+    sp.y = y < 0 ? 0 : (int)(y + 0.5);
+    CallWindowProcW(g_reProc, h, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
+}
+/* zvisla poloha znaku v dokumente (0 = zaciatok obsahu) */
+static double sc_y(HWND h, int cp, int sy, int top) {
+    POINTL p; p.x = p.y = 0; CallWindowProcW(g_reProc, h, EM_POSFROMCHAR, (WPARAM)&p, cp);
+    return (double)p.y + sy - top;
+}
+static double clamp01(double f) { return f < 0 ? 0 : f > 1 ? 1 : f; }
+static double ed_line_y(double line, int sy, int top) {
+    int i; double y0, y1;
+    if (g_nLines <= 0) return 0;
+    if (line < 0) line = 0;
+    i = (int)line;
+    if (i >= g_nLines - 1) return sc_y(hEdit, g_lineStart[g_nLines - 1], sy, top);
+    y0 = sc_y(hEdit, g_lineStart[i], sy, top); y1 = sc_y(hEdit, g_lineStart[i + 1], sy, top);
+    return y0 + (line - i) * (y1 - y0);
+}
+/* zdrojovy riadok (s desatinnou castou) na hornom okraji editora */
+static double ed_top_line(int sy, int top) {
+    int lo = 0, hi = g_nLines - 1; double y0, y1;
+    if (g_nLines <= 0) return 0;
+    while (lo < hi) { int mid = (lo + hi + 1) / 2; if (sc_y(hEdit, g_lineStart[mid], sy, top) <= sy) lo = mid; else hi = mid - 1; }
+    if (lo >= g_nLines - 1) return lo;
+    y0 = sc_y(hEdit, g_lineStart[lo], sy, top); y1 = sc_y(hEdit, g_lineStart[lo + 1], sy, top);
+    return lo + (y1 > y0 ? clamp01((sy - y0) / (y1 - y0)) : 0);
+}
+/* bod mapovania k: -1 = zaciatok dokumentu, g_nblk = koniec */
+static void blk_pt(int k, int sy, int top, double *line, double *y) {
+    if (k < 0) { *line = 0; *y = 0; return; }
+    if (k >= g_nblk) { *line = g_nLines; *y = sc_y(hView, g_viewLen > 0 ? g_viewLen - 1 : 0, sy, top); return; }
+    *line = g_blk[k].line; *y = sc_y(hView, g_blk[k].cp, sy, top);
+}
+static void sync_e2v(void) {
+    int se = sc_get(hEdit), te = sc_top(hEdit), sv = sc_get(hView), tv = sc_top(hView), lo = -1, hi = g_nblk - 1;
+    double L = ed_top_line(se, te), l0, y0, l1, y1;
+    while (lo < hi) { int mid = (lo + hi + 1) / 2; if (g_blk[mid].line <= L) lo = mid; else hi = mid - 1; }
+    blk_pt(lo, sv, tv, &l0, &y0); blk_pt(lo + 1, sv, tv, &l1, &y1);
+    sc_set(hView, l1 > l0 ? y0 + clamp01((L - l0) / (l1 - l0)) * (y1 - y0) : y0);
+}
+static void sync_v2e(void) {
+    int sv = sc_get(hView), tv = sc_top(hView), se = sc_get(hEdit), te = sc_top(hEdit), lo = -1, hi = g_nblk - 1;
+    double l0, y0, l1, y1, L;
+    while (lo < hi) { int mid = (lo + hi + 1) / 2; if (sc_y(hView, g_blk[mid].cp, sv, tv) <= sv) lo = mid; else hi = mid - 1; }
+    blk_pt(lo, sv, tv, &l0, &y0); blk_pt(lo + 1, sv, tv, &l1, &y1);
+    L = y1 > y0 ? l0 + clamp01((sv - y0) / (y1 - y0)) * (l1 - l0) : l0;
+    sc_set(hEdit, ed_line_y(L, se, te));
+}
+static int sync_ok(void) { return g_edit && !g_help && g_nLines > 0 && hEdit && hView; }
+static void sync_mark(void) { if (hEdit && hView) { g_lastSy[0] = sc_get(hEdit); g_lastSy[1] = sc_get(hView); } }
+static void sync_from(HWND src) {
+    if (!sync_ok()) return;
+    g_syncing++;
+    if (src == hEdit) sync_e2v(); else sync_v2e();
+    g_syncing--;
+    sync_mark();
+}
+/* dvojklik v nahlade: oznaci prislusny riadok v editore na rovnakej vyske obrazovky */
+static void jump_to_source(int x, int y) {
+    POINTL p; CHARRANGE cr; int cp, sv = sc_get(hView), tv = sc_top(hView), se, te, lo = -1, hi = g_nblk - 1, line;
+    double l0, y0, l1, y1, L, yc;
+    p.x = x; p.y = y; cp = (int)CallWindowProcW(g_reProc, hView, EM_CHARFROMPOS, 0, (LPARAM)&p);
+    yc = sc_y(hView, cp, sv, tv);
+    while (lo < hi) { int mid = (lo + hi + 1) / 2; if (g_blk[mid].cp <= cp) lo = mid; else hi = mid - 1; }
+    blk_pt(lo, sv, tv, &l0, &y0); blk_pt(lo + 1, sv, tv, &l1, &y1);
+    L = (y1 > y0 && l1 > l0) ? l0 + clamp01((yc - y0) / (y1 - y0)) * (l1 - l0) : l0;
+    line = (int)L;
+    if (l1 > l0 && line >= (int)l1) line = (int)l1 - 1;
+    if (line > g_nLines - 1) line = g_nLines - 1; if (line < 0) line = 0;
+    g_syncing++;
+    se = sc_get(hEdit); te = sc_top(hEdit);
+    sc_set(hEdit, ed_line_y(line, se, te) + te - (yc - sv + tv));
+    cr.cpMin = g_lineStart[line]; cr.cpMax = line + 1 < g_nLines ? g_lineStart[line + 1] - 1 : -1;
+    CallWindowProcW(g_reProc, hEdit, EM_EXSETSEL, 0, (LPARAM)&cr);
+    g_syncing--;
+    sync_mark();
+    g_lastPane = hEdit; SetFocus(hEdit);
+}
+static int view_top_cp(void) {
+    RECT r; POINTL p;
+    CallWindowProcW(g_reProc, hView, EM_GETRECT, 0, (LPARAM)&r);
+    p.x = r.left + 1; p.y = r.top + 1;
+    return (int)CallWindowProcW(g_reProc, hView, EM_CHARFROMPOS, 0, (LPARAM)&p);
+}
+
 /* ---------- vzhlad ---------- */
 static void editor_format(void) {
     CHARFORMAT2W cf; ZeroMemory(&cf, sizeof cf); cf.cbSize = sizeof cf;
@@ -1045,14 +1179,20 @@ static void apply_theme(void) {
     RedrawWindow(hMain, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 static void set_edit_mode(int on) {
+    int cp = view_top_cp();          /* co sa prave cita v nahlade */
     g_edit = on; layout();
+    render(0);
+    g_syncing++;                     /* po zmene sirky nahladu ostane na vrchu to iste miesto */
+    sc_set(hView, sc_y(hView, cp, sc_get(hView), sc_top(hView)));
+    g_syncing--;
+    if (on) sync_from(hView); else sync_mark();   /* editor otvori presne to, co sa citalo */
     g_lastPane = on ? hEdit : hView; SetFocus(g_lastPane);
-    render(0); g_lastViewW = 0;
+    g_lastViewW = 0;
     InvalidateRect(hBtn[2], NULL, TRUE); InvalidateRect(hMain, NULL, TRUE);
 }
 static void set_zoom(int fs) {
     if (fs < 14) fs = 14; if (fs > 44) fs = 44;
-    g_fs = fs; editor_format(); render(0);
+    g_fs = fs; editor_format(); render(0); sync_from(hEdit);
 }
 static void reg_load(void) {
     DWORD v, cb = sizeof v;
@@ -1072,7 +1212,7 @@ static void reg_save(void) {
    Najnovsie vydanie: tag "vX.Y" a prilozeny subor s nazvom presne MDView.exe.
    Kontrola bezi na pozadi; stiahnuty subor sa vymeni za beziace exe a aplikacia sa restartuje. */
 #ifndef APP_VERSION
-#define APP_VERSION "1.1"
+#define APP_VERSION "1.2"
 #endif
 #define UPD_API_HOST L"api.github.com"
 #define UPD_API_PATH L"/repos/JurajCyprich/MDView/releases/latest"
@@ -1208,8 +1348,11 @@ static void ctx_menu(HWND h, int x, int y) {
     else if (cmd == IDM_UNDO) SendMessageW(h, EM_UNDO, 0, 0);
     else if (cmd == IDM_SELALL) { CHARRANGE all = { 0, -1 }; SendMessageW(h, EM_EXSETSEL, 0, (LPARAM)&all); }
 }
-static LRESULT CALLBACK ReProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+static LRESULT ReProc0(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
+    case WM_LBUTTONDBLCLK:
+        if (h == hView && sync_ok()) { jump_to_source(GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0; }
+        break;
     case WM_DROPFILES: return SendMessageW(hMain, WM_DROPFILES, wp, lp);
     case WM_SETFOCUS: g_lastPane = h; break;
     case WM_CONTEXTMENU: ctx_menu(h, GET_X_LPARAM(lp), GET_Y_LPARAM(lp)); return 0;
@@ -1233,6 +1376,16 @@ static LRESULT CALLBACK ReProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         break;
     }
     return CallWindowProcW(g_reProc, h, m, wp, lp);
+}
+/* po kazdej sprave zisti, ci sa panel posunul (koliesko, posuvnik, klavesy, plynule
+   posuvanie, pisanie...), a ak ano, posunie druhy panel na zodpovedajuce miesto */
+static LRESULT CALLBACK ReProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    LRESULT r = ReProc0(h, m, wp, lp);
+    if (!g_syncing && m != WM_DESTROY && m != WM_NCDESTROY && (h == hEdit || h == hView) && sync_ok()) {
+        int i = (h == hView), y = sc_get(h);
+        if (y != g_lastSy[i]) { g_lastSy[i] = y; sync_from(h); }
+    }
+    return r;
 }
 static LRESULT CALLBACK SearchProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     if (m == WM_KEYDOWN && wp == VK_RETURN) {
@@ -1341,11 +1494,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_LBUTTONUP:
-        if (g_dragSplit) { g_dragSplit = 0; ReleaseCapture(); if (g_hasTable) render(0); }
+        if (g_dragSplit) { g_dragSplit = 0; ReleaseCapture(); if (g_hasTable) render(0); sync_from(hEdit); }
         return 0;
     case WM_TIMER:
         KillTimer(h, wp);
-        if (wp == T_RENDER || wp == T_RESIZE) render(0);
+        if (wp == T_RENDER || wp == T_RESIZE) { render(0); sync_from(hEdit); }
         else if (wp == T_FIND) find_changed();
         return 0;
     case WM_APP_UPDCHECK:
@@ -1485,6 +1638,22 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
         if (_wgetenv(L"MDV_TEST_FIND")) {   /* predvyplni hladanie a skoci na 2. vyskyt */
             SetWindowTextW(hSearch, _wgetenv(L"MDV_TEST_FIND")); KillTimer(hMain, T_FIND);
             ShowWindow(hBtn[9], SW_SHOW); find_changed(); do_find(1, 0);
+        }
+        /* MDV_TEST_SYNC=n: editor na riadok n; MDV_TEST_SYNCV=y: nahlad na y px; MDV_TEST_DBL=x,y: dvojklik */
+        if (_wgetenv(L"MDV_TEST_SYNC") || _wgetenv(L"MDV_TEST_SYNCV")) {
+            POINT sp = { 0, 0 };
+            set_edit_mode(1);
+            if (_wgetenv(L"MDV_TEST_SYNC")) {
+                sp.y = (int)ed_line_y(_wtoi(_wgetenv(L"MDV_TEST_SYNC")), sc_get(hEdit), sc_top(hEdit));
+                SendMessageW(hEdit, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
+            } else {
+                sp.y = _wtoi(_wgetenv(L"MDV_TEST_SYNCV"));
+                SendMessageW(hView, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
+            }
+            if (_wgetenv(L"MDV_TEST_DBL")) {
+                int x = 0, y = 0; swscanf(_wgetenv(L"MDV_TEST_DBL"), L"%d,%d", &x, &y);
+                SendMessageW(hView, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(x, y));
+            }
         }
     }
 #endif

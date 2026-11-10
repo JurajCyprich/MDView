@@ -51,6 +51,10 @@ Hľadá sa v náhľade. Ak máte zapnutý editor a kurzor je v ňom, hľadá sa 
 
 Tlačidlo **Upraviť** alebo `Ctrl+E` rozdelí okno na dve časti: vľavo je zdrojový text, vpravo náhľad, ktorý sa pri písaní priebežne obnovuje. Deliacu čiaru medzi nimi možno ťahať myšou.
 
+Editor a náhľad sa **posúvajú spolu**: keď posuniete jeden, druhý ukáže to isté miesto dokumentu. Po zapnutí editora sa otvorí presne tam, kde ste práve čítali.
+
+Ak v náhľade nájdete miesto, ktoré chcete zmeniť, **dvakrát naň kliknite** — v editore sa označí zodpovedajúci riadok a kurzor sa presunie doň.
+
 To isté tlačidlo editor zase **skryje** a ostane čisté zobrazenie.
 
 - `Ctrl+S` uloží zmeny do pôvodného súboru.

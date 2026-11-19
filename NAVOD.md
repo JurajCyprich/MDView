@@ -5,6 +5,8 @@ MD View je jednoduchý prehliadač a editor súborov **Markdown** (`.md`). Je to
 Tento návod zatvoríte klávesom `F1`, `Esc` alebo tlačidlom **Návod**.
 
 - [Otvorenie súboru](#otvorenie-súboru)
+- [Dokumenty z internetu](#dokumenty-z-internetu)
+- [Uložené odkazy a úvodná stránka](#uložené-odkazy-a-úvodná-stránka)
 - [Čítanie a kopírovanie textu](#čítanie-a-kopírovanie-textu)
 - [Hľadanie](#hľadanie)
 - [Úprava dokumentu](#úprava-dokumentu)
@@ -16,13 +18,42 @@ Tento návod zatvoríte klávesom `F1`, `Esc` alebo tlačidlom **Návod**.
 
 ## Otvorenie súboru
 
-Súbor otvoríte tromi spôsobmi:
+Súbor otvoríte týmito spôsobmi:
 
 1. **Pretiahnutím** súboru myšou do okna aplikácie.
 2. Tlačidlom **Otvoriť** alebo skratkou `Ctrl+O`.
-3. Pretiahnutím súboru na ikonu `MDView.exe`, prípadne cez *Otvoriť v programe* v Prieskumníkovi.
+3. Skratkou `Ctrl+L` — napíšete alebo vložíte cestu k súboru (napr. skopírovanú cez *Kopírovať ako cestu*).
+4. Pretiahnutím súboru na ikonu `MDView.exe`, prípadne cez *Otvoriť v programe* v Prieskumníkovi.
 
 Ak sa súbor medzičasom zmenil na disku, `F5` ho načíta znova.
+
+## Dokumenty z internetu
+
+MD View otvorí aj dokument z webovej adresy:
+
+- `Ctrl+L` (alebo **Odkazy ▾ → Otvoriť webovú adresu**) a vložte adresu. Ak máte adresu skopírovanú, okno ju predvyplní samo.
+- Alebo **pretiahnite odkaz** z prehliadača priamo do okna.
+
+Funguje adresa priamo na súbor `.md`, ale aj bežná stránka súboru na **GitHube** či **GitLabe**, odkaz na súbor na **Google Disku** a **Dropboxe** — aplikácia si z nej sama urobí odkaz na obsah súboru. Súbor musí byť verejne dostupný (bez prihlásenia).
+
+Obrázky a odkazy na ďalšie `.md` súbory v takom dokumente sa načítajú z rovnakého webového priečinka. Ďalšie `.md` dokumenty sa otvoria priamo v MD View, ostatné odkazy v prehliadači.
+
+Dokument z webu môžete upravovať; `Ctrl+S` ho uloží ako **nový súbor v počítači** (na web sa späť neukladá). `F5` ho stiahne znova.
+
+## Uložené odkazy a úvodná stránka
+
+Keď spustíte MD View bez dokumentu, zobrazí sa **úvodná stránka** so zoznamom uložených odkazov a naposledy otvorených dokumentov — z počítača aj z internetu. Kliknutím na názov sa dokument otvorí.
+
+- **☆** v hornom paneli (`Ctrl+B`) uloží odkaz na otvorený dokument. Pri uloženom dokumente je hviezdička plná **★**; ďalším kliknutím ho z odkazov odoberiete.
+- **Pridať odkaz** na úvodnej stránke uloží adresu alebo cestu bez otvárania dokumentu.
+- **odstrániť** pri odkaze ho zmaže zo zoznamu (samotný súbor ani stránku nie).
+
+K inému dokumentu sa dostanete dvoma spôsobmi:
+
+- **Odkazy ▾** — menu s uloženými a naposledy otvorenými dokumentmi; otvoríte ich priamo, bez zatvárania aktuálneho.
+- **Domov** (`Ctrl+W`) — zavrie dokument (aplikácia ostane otvorená) a ukáže úvodnú stránku.
+
+Odkazy sa ukladajú do súboru `%APPDATA%\MDView\odkazy.txt`.
 
 ## Čítanie a kopírovanie textu
 
@@ -33,8 +64,9 @@ Kliknutie na odkaz:
 | Typ odkazu | Čo sa stane |
 | :-- | :-- |
 | Webová adresa (`https://…`) | Otvorí sa v predvolenom prehliadači |
-| Kotva (`#nadpis`) | Dokument sa posunie na daný nadpis |
-| Iný súbor `.md` | Otvorí sa priamo v MD View |
+| Kotva (`#nadpis` alebo `<a id="...">`) | Dokument sa posunie na dané miesto |
+| Iný súbor `.md` (v počítači aj na webe) | Otvorí sa priamo v MD View |
+| Súbor PDF, obrázok, dokument Office | Otvorí sa v programe, ktorý ho má otvárať |
 
 ## Hľadanie
 
@@ -85,10 +117,13 @@ Aktualizácia potrebuje pripojenie na internet a `MDView.exe` musí byť v prie�
 | Skratka | Akcia |
 | :-- | :-- |
 | `Ctrl+O` | Otvoriť súbor |
+| `Ctrl+L` | Otvoriť webovú adresu alebo cestu |
+| `Ctrl+B` | Uložiť / odobrať odkaz na dokument |
+| `Ctrl+W` | Domov — zavrieť dokument |
 | `Ctrl+S` | Uložiť |
 | `Ctrl+Shift+S` | Uložiť ako |
 | `Ctrl+N` | Nový dokument |
-| `F5` | Znovu načítať súbor z disku |
+| `F5` | Znovu načítať dokument |
 | `Ctrl+E` | Zobraziť / skryť editor |
 | `Ctrl+D` | Svetlý / tmavý režim |
 | `Ctrl+F` | Hľadať |
@@ -108,10 +143,14 @@ Aktualizácia potrebuje pripojenie na internet a `MDView.exe` musí byť v prie�
 - Tabuľky so zarovnaním stĺpcov a zalomením riadku cez `<br>`
 - Bloky kódu medzi trojicami spätných apostrofov
 - Citácie, vodorovné čiary a odkazy
+- **Obrázky** — `![popis](img/obrazok.png)` aj `<img src="..." width="300">`; cesta sa berie od priečinka **dokumentu**, takže stačí mať priečinok s obrázkami vedľa súboru `.md`. Fungujú aj obrázky z internetu.
+- Kotvy `<a id="obsah"></a>` — sú neviditeľné a odkaz `[Obsah](#obsah)` na ne spoľahlivo skočí aj pri diakritike
+- Základné HTML: `<b>`, `<i>`, `<u>`, `<sup>`, `<sub>`, `<br>`, `<a href>`; komentáre `<!-- -->` sa nezobrazia
 
 Obmedzenia:
 
-- Obrázky sa nezobrazujú, namiesto nich je text *[obrázok: popis]*.
+- Obrázky SVG sa nezobrazia (zobrazí sa len poznámka); PNG, JPEG, GIF, BMP a WebP áno.
+- Ak sa obrázok nenájde, na jeho mieste je poznámka s cestou, ktorú aplikácia hľadala.
 - Emoji sú čiernobiele.
 - Široké tabuľky sa prispôsobia šírke okna, nemajú vodorovný posuvník.
 
@@ -119,11 +158,11 @@ Obmedzenia:
 
 Windows obsahuje komponent **RichEdit** — ten istý, ktorý používa WordPad. Vie zobraziť formátovaný text s tabuľkami, označovať ho, kopírovať a hľadať v ňom. MD View si preto text nekreslí sám:
 
-1. Súbor sa načíta (UTF-8, UTF-16 alebo stredoeurópske kódovanie).
+1. Súbor sa načíta z disku alebo stiahne z internetu (UTF-8, UTF-16 alebo stredoeurópske kódovanie).
 2. Text sa prejde po riadkoch a rozpozná sa, čo je nadpis, zoznam, tabuľka, citácia, kód alebo odstavec.
 3. Vnútri každého bloku sa nájde tučné písmo, kurzíva, kód a odkazy.
 4. Z toho sa vygeneruje dokument vo formáte RTF s farbami aktuálneho režimu.
-5. RTF sa odovzdá RichEditu, ktorý ho zobrazí.
+5. RTF sa odovzdá RichEditu, ktorý ho zobrazí, a na miesta obrázkov vloží samotné obrázky.
 
 Pri každej úprave textu, zmene režimu alebo veľkosti písma sa kroky 2 až 5 zopakujú. Vďaka tomu je celá aplikácia jeden malý súbor bez ďalších závislostí.
 

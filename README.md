@@ -7,6 +7,9 @@ Jednoduchý prehliadač a editor súborov Markdown pre Windows 10/11. Jeden samo
 - otvorenie súboru pretiahnutím do okna alebo cez `Ctrl+O`
 - hľadanie so zvýraznením výskytov, bez ohľadu na diakritiku
 - označovanie a kopírovanie textu
+- otvorenie dokumentu aj z webovej adresy (GitHub, GitLab, Google Disk, Dropbox…)
+- úvodná stránka s uloženými a naposledy otvorenými dokumentmi
+- obrázky relatívne k dokumentu, kotvy `<a id>` a základné HTML značky
 - vstavaný návod (`F1`)
 - aktualizácia priamo z aplikácie (tlačidlo **Aktualizovať** alebo `Ctrl+U`)
 

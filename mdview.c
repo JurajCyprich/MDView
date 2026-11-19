@@ -19,18 +19,20 @@
 #include <string.h>
 #include <stdarg.h>
 #include <wchar.h>
-#ifdef MDV_TEST
+#include <ctype.h>
 #include <shlobj.h>
-#endif
+#include <shlwapi.h>
+#include <wincodec.h>
 
 #define APP L"MD View"
 #define REGKEY L"Software\\MDView"
 
 enum { ID_OPEN = 100, ID_SAVE, ID_SAVEAS, ID_EDIT, ID_THEME, ID_ZOOMOUT, ID_ZOOMIN, ID_ZOOM0,
        ID_FIND, ID_NEXT, ID_PREV, ID_ESC, ID_NEW, ID_RELOAD, ID_HELP, ID_CLEAR, ID_UPDATE, ID_UPDCHECK,
+       ID_HOME, ID_LINKS, ID_STAR, ID_OPENURL,
        IDC_EDITOR = 200, IDC_VIEW, IDC_SEARCH, IDC_COUNT,
        IDM_COPY = 300, IDM_SELALL, IDM_CUT, IDM_PASTE, IDM_UNDO };
-enum { T_RENDER = 1, T_RESIZE, T_FIND };
+enum { T_RENDER = 1, T_RESIZE, T_FIND, T_IMG };
 
 /* sentinely vkladane do RTF, po nacitani sa z dokumentu odstrania */
 #define S_LINK_A 0xE000
@@ -38,6 +40,7 @@ enum { T_RENDER = 1, T_RESIZE, T_FIND };
 #define S_HEAD   0xE002
 #define S_BREAK  0xE003
 #define S_BLOCK  0xE004   /* zaciatok bloku; nesie zdrojovy riadok pre synchronizaciu */
+#define S_IMG    0xE005   /* miesto obrazka; po nacitani sa nahradi obrazkom (1 znak) */
 
 typedef struct { COLORREF bg, text, link, codebg, border, thbg, muted, codefg,
                  bar, barText, btn, btnDown, accent, editBg; } Theme;
@@ -58,7 +61,7 @@ static const wchar_t *g_srcBase;                /* zdrojovy text pocas vykreslov
 static int g_syncing, g_lastSy[2];              /* synchronizacia posuvania editor <-> nahlad */
 static void sync_mark(void);
 
-static HWND hMain, hEdit, hView, hSearch, hCount, hBtn[11];
+static HWND hMain, hEdit, hView, hSearch, hCount, hBtn[14];
 static RECT g_searchRc;  /* ramcek okolo hladacieho pola */
 static int g_help = 0;   /* 1 = v nahlade je zobrazeny vstavany navod */
 static HWND g_lastPane;
@@ -76,20 +79,20 @@ static POINT g_downPt;
 #define S(x) MulDiv((x), g_dpi, 96)
 #define FS(x) ((x) * g_fs / 22)
 
-static const wchar_t WELCOME[] =
-    L"# MD View\n\n"
-    L"Pretiahnite sem súbor **.md** alebo stlačte **Ctrl+O**.\n\n"
+static const wchar_t HOME_KEYS[] =
+    L"## Klávesové skratky\n\n"
     L"| Skratka | Akcia |\n| :-- | :-- |\n"
     L"| `Ctrl+O` | Otvoriť súbor |\n"
+    L"| `Ctrl+L` | Otvoriť webovú adresu alebo cestu |\n"
+    L"| `Ctrl+B` | Uložiť / odobrať odkaz na otvorený dokument |\n"
+    L"| `Ctrl+W` | Zavrieť dokument a vrátiť sa sem |\n"
     L"| `Ctrl+S` / `Ctrl+Shift+S` | Uložiť / Uložiť ako |\n"
     L"| `Ctrl+E` | Zapnúť / skryť editor |\n"
     L"| `Ctrl+D` | Svetlý / tmavý režim |\n"
     L"| `Ctrl+F` | Hľadať — `Enter` / `F3` ďalší, `Shift+F3` predošlý, `Esc` zrušiť |\n"
-    L"| `Ctrl+C` | Kopírovať označený text |\n"
     L"| `Ctrl +` / `Ctrl −` / `Ctrl+0` | Veľkosť písma |\n"
-    L"| `F5` | Znovu načítať súbor z disku |\n"
-    L"| `F1` | Návod |\n"
-    L"| `Ctrl+U` | Skontrolovať aktualizácie |\n";
+    L"| `F5` | Znovu načítať dokument |\n"
+    L"| `F1` | Návod |\n";
 
 /* ---------- buffre ---------- */
 typedef struct { char *p; size_t n, cap; } SB;
@@ -143,12 +146,252 @@ static wchar_t *get_text(HWND h, int crlf, int *outn) {
     w[got] = 0; if (outn) *outn = got; return w;
 }
 
-/* ---------- drag & drop suborov (vlastny OLE drop target) ----------
-   RichEdit si registruje vlastny drop target, ktory subory neprijima; nahradzame ho tymto. */
+/* ---------- adresy: lokalne cesty aj webove adresy ---------- */
+static int is_url(const wchar_t *s) { int n = (int)wcslen(s); return starts_i(s, n, L"http://") || starts_i(s, n, L"https://"); }
+static int g_online;   /* 1 = otvoreny dokument je z internetu (g_path je URL) */
+
+/* %XX -> znaky; kodovanie je UTF-8 */
+static void url_decode(const wchar_t *in, wchar_t *out, int cap) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, in, -1, NULL, 0, NULL, NULL), i, k = 0;
+    char *a = (char *)malloc(n + 1), *b = (char *)malloc(n + 1);
+    WideCharToMultiByte(CP_UTF8, 0, in, -1, a, n, NULL, NULL);
+    for (i = 0; a[i]; i++) {
+        if (a[i] == '%' && isxdigit((unsigned char)a[i + 1]) && isxdigit((unsigned char)a[i + 2])) {
+            char hx[3]; hx[0] = a[i + 1]; hx[1] = a[i + 2]; hx[2] = 0; b[k++] = (char)strtol(hx, NULL, 16); i += 2;
+        } else b[k++] = a[i];
+    }
+    b[k] = 0;
+    if (!MultiByteToWideChar(CP_UTF8, 0, b, -1, out, cap)) lstrcpynW(out, in, cap);
+    free(a); free(b);
+}
+/* medzery, diakritika a pod. -> %XX (uz zakodovane %XX ostanu); '\' -> '/' */
+static void url_encode(const wchar_t *in, wchar_t *out, int cap) {
+    int n = WideCharToMultiByte(CP_UTF8, 0, in, -1, NULL, 0, NULL, NULL), i, k = 0; char *a = (char *)malloc(n + 1);
+    WideCharToMultiByte(CP_UTF8, 0, in, -1, a, n, NULL, NULL);
+    for (i = 0; a[i] && k < cap - 4; i++) {
+        unsigned char ch = (unsigned char)a[i];
+        if (ch == '\\') out[k++] = '/';
+        else if (ch <= 0x20 || ch >= 0x7F || strchr("\"<>^`{|}", ch)) { _snwprintf(out + k, 4, L"%%%02X", ch); k += 3; }
+        else out[k++] = ch;
+    }
+    out[k] = 0; free(a);
+}
+/* odkaz na webovu stranku so suborom -> odkaz priamo na obsah suboru */
+static void normalize_url(const wchar_t *in, wchar_t *out, int cap) {
+    const wchar_t *p; wchar_t t[2200]; int n = (int)wcslen(in);
+    lstrcpynW(out, in, cap);
+    if (starts_i(in, n, L"https://github.com/") && (p = wcsstr(in + 19, L"/blob/")) != NULL) {
+        _snwprintf(t, 2199, L"https://raw.githubusercontent.com/%.*s/%s", (int)(p - (in + 19)), in + 19, p + 6); t[2199] = 0;
+        lstrcpynW(out, t, cap);
+    } else if ((p = wcsstr(in, L"/-/blob/")) != NULL) {                       /* GitLab */
+        _snwprintf(t, 2199, L"%.*s/-/raw/%s", (int)(p - in), in, p + 8); t[2199] = 0; lstrcpynW(out, t, cap);
+    } else if (starts_i(in, n, L"https://drive.google.com/file/d/")) {          /* Google Disk */
+        const wchar_t *id = in + 32; int k = 0; while (id[k] && id[k] != '/' && id[k] != '?') k++;
+        _snwprintf(t, 2199, L"https://drive.google.com/uc?export=download&id=%.*s", k, id); t[2199] = 0; lstrcpynW(out, t, cap);
+    } else if (wcsstr(in, L"dropbox.com/")) {                                   /* Dropbox */
+        wchar_t *d; lstrcpynW(t, in, 2100);
+        if ((d = wcsstr(t, L"dl=0")) != NULL) d[3] = '1';
+        else if (!wcsstr(t, L"dl=1") && !wcsstr(t, L"raw=1")) wcscat(t, wcschr(t, '?') ? L"&dl=1" : L"?dl=1");
+        lstrcpynW(out, t, cap);
+    }
+}
+/* odkaz z dokumentu -> uplna cesta (1) alebo webova adresa (2); 0 = neda sa urcit.
+   Relativne odkazy sa beru od priecinka DOKUMENTU, nie od priecinka aplikacie. */
+static int resolve_ref(const wchar_t *ref, int rn, wchar_t *out, int cap) {
+    wchar_t r[1100], d[1100], *sl; int a = 0;
+    if (rn > 1099) rn = 1099;
+    while (a < rn && is_sp(ref[a])) a++;
+    while (rn > a && is_sp(ref[rn - 1])) rn--;
+    memcpy(r, ref + a, (rn - a) * sizeof(wchar_t)); r[rn - a] = 0;
+    if (!r[0]) return 0;
+    if (is_url(r)) { wchar_t t[2200]; normalize_url(r, t, 2200); url_encode(t, out, cap); return 2; }
+    if (starts_i(r, (int)wcslen(r), L"file:")) {
+        const wchar_t *p = r + 5; while (*p == '/') p++;
+        url_decode(p, out, cap); for (sl = out; *sl; sl++) if (*sl == '/') *sl = '\\';
+        return 1;
+    }
+    if (g_online) {
+        wchar_t e[2200]; DWORD len = cap;
+        url_encode(r, e, 2200);
+        return UrlCombineW(g_path, e, out, &len, 0) == S_OK ? 2 : 0;
+    }
+    url_decode(r, d, 1100);
+    for (sl = d; *sl; sl++) if (*sl == '/') *sl = '\\';
+    if ((d[0] && d[1] == ':') || (d[0] == '\\' && d[1] == '\\')) { lstrcpynW(out, d, cap); return 1; }
+    if (!g_path[0]) return 0;
+    wcscpy(r, g_path); sl = wcsrchr(r, '\\'); if (!sl) return 0; sl[1] = 0;
+    sl = d; while (*sl == '\\') sl++;
+    if (wcslen(r) + wcslen(sl) >= 1099) return 0;
+    wcscat(r, sl);
+    if (!PathCanonicalizeW(d, r)) lstrcpynW(d, r, 1100);
+    lstrcpynW(out, d, cap);
+    return 1;
+}
+/* nazov suboru z cesty alebo adresy */
+static void loc_name(const wchar_t *loc, wchar_t *out, int cap) {
+    wchar_t t[1100], *q, *s;
+    lstrcpynW(t, loc, 1100);
+    if (is_url(t)) {
+        if ((q = wcspbrk(t, L"?#")) != NULL) *q = 0;
+        while ((s = wcsrchr(t, '/')) != NULL && !s[1] && s > t) *s = 0;
+        s = wcsrchr(t, '/'); url_decode(s ? s + 1 : t, out, cap);
+    } else { s = wcsrchr(t, '\\'); lstrcpynW(out, s ? s + 1 : t, cap); }
+    if (!out[0]) lstrcpynW(out, loc, cap);
+}
+static int has_md_ext(const wchar_t *loc) {
+    wchar_t t[1100], *q, *e; lstrcpynW(t, loc, 1100);
+    if (is_url(t) && (q = wcspbrk(t, L"?#")) != NULL) *q = 0;
+    e = wcsrchr(t, '.'); if (!e || wcschr(e, '/') || wcschr(e, '\\')) return 0;
+    return !_wcsicmp(e, L".md") || !_wcsicmp(e, L".markdown") || !_wcsicmp(e, L".txt");
+}
+
+/* ---------- siet ---------- */
+static BYTE *http_get_url(const wchar_t *url, DWORD maxLen, DWORD *outLen, DWORD *status) {
+    URL_COMPONENTS uc; wchar_t host[256], path[2200], extra[2200];
+    HINTERNET s = NULL, c = NULL, r = NULL; BYTE *buf = NULL; DWORD n = 0, cap = 0, st = 0, sl = sizeof st; int ok = 0;
+    *outLen = 0; if (status) *status = 0;
+    ZeroMemory(&uc, sizeof uc); uc.dwStructSize = sizeof uc;
+    uc.lpszHostName = host; uc.dwHostNameLength = 256;
+    uc.lpszUrlPath = path; uc.dwUrlPathLength = 2100;
+    uc.lpszExtraInfo = extra; uc.dwExtraInfoLength = 2100;
+    if (!WinHttpCrackUrl(url, 0, 0, &uc)) return NULL;
+    { wchar_t *h = wcschr(extra, '#'); if (h) *h = 0; }
+    if (!path[0]) wcscpy(path, L"/");
+    if (wcslen(path) + wcslen(extra) < 2190) wcscat(path, extra);
+    s = WinHttpOpen(L"MDView", 4 /*AUTOMATIC_PROXY*/, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0); if (!s) goto end;
+    WinHttpSetTimeouts(s, 10000, 10000, 15000, 30000);
+    c = WinHttpConnect(s, host, uc.nPort, 0); if (!c) goto end;
+    r = WinHttpOpenRequest(c, L"GET", path, NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                           uc.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+    if (!r) goto end;
+    if (!WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(r, NULL)) goto end;
+    if (!WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &st, &sl, WINHTTP_NO_HEADER_INDEX)) goto end;
+    if (status) *status = st;
+    if (st != 200) goto end;
+    for (;;) {
+        DWORD got = 0;
+        if (n + 65536 + 2 > cap) { cap = cap * 2 + 262144; buf = (BYTE *)realloc(buf, cap); }
+        if (!WinHttpReadData(r, buf + n, 65536, &got)) goto end;
+        if (!got) { ok = 1; break; }
+        n += got; if (n > maxLen) goto end;
+    }
+end:
+    if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c); if (s) WinHttpCloseHandle(s);
+    if (!ok) { free(buf); return NULL; }
+    buf[n] = buf[n + 1] = 0; *outLen = n; return buf;
+}
+/* stahovanie na pozadi: vysledok pride ako sprava msg s ukazovatelom na NetJob */
+typedef struct { wchar_t url[1100]; UINT msg; BYTE *data; DWORD n, status; } NetJob;
+#define WM_APP_DOC (WM_APP + 4)
+#define WM_APP_IMG (WM_APP + 5)
+static DWORD WINAPI net_thread(LPVOID p) {
+    NetJob *j = (NetJob *)p;
+    j->data = http_get_url(j->url, 48u << 20, &j->n, &j->status);
+    PostMessageW(hMain, j->msg, 0, (LPARAM)j);
+    return 0;
+}
+static void start_net(const wchar_t *url, UINT msg) {
+    NetJob *j = (NetJob *)calloc(1, sizeof(NetJob)); HANDLE t;
+    lstrcpynW(j->url, url, 1100); j->msg = msg;
+    t = CreateThread(NULL, 0, net_thread, j, 0, NULL);
+    if (t) CloseHandle(t); else PostMessageW(hMain, msg, 0, (LPARAM)j);
+}
+static BYTE *read_all(const wchar_t *path, DWORD maxLen, DWORD *outLen) {
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    LARGE_INTEGER sz; BYTE *buf; DWORD rd = 0;
+    *outLen = 0;
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart > maxLen) { CloseHandle(h); return NULL; }
+    buf = (BYTE *)malloc((size_t)sz.QuadPart + 4);
+    if (!ReadFile(h, buf, (DWORD)sz.QuadPart, &rd, NULL)) rd = 0;
+    CloseHandle(h);
+    buf[rd] = buf[rd + 1] = 0; *outLen = rd; return buf;
+}
+
+/* ---------- obrazky ----------
+   Obrazok sa nacita raz (lokalne hned, z webu na pozadi) a drzi sa v pamati.
+   Do nahladu ho vlozi RichEdit cez EM_INSERTIMAGE, ktory sam dekoduje PNG, JPEG, GIF, BMP... */
+typedef struct { wchar_t key[1100]; BYTE *data; DWORD n; int w, h, state; } Img;   /* state: 0 caka, 1 ok, 2 chyba */
+static Img *g_img; static int g_nimg, g_capimg;
+typedef struct { int idx; LONG w, h; } ImgUse;                                     /* rozmery v HIMETRIC */
+static ImgUse *g_use; static int g_nuse, g_capuse;
+static int g_cellTw, g_curLi;   /* sirka bunky tabulky / odsadenie odseku (twips) pri vkladani obrazka */
+static IWICImagingFactory *g_wic;
+static const GUID MY_CLSID_WIC = { 0xcacaf262, 0x9370, 0x4615, { 0xa1, 0x3b, 0x9f, 0x55, 0x39, 0xda, 0x4c, 0x0a } };
+static const GUID MY_IID_WICF  = { 0xec5ec8a9, 0xc395, 0x4314, { 0x9c, 0x77, 0x54, 0xd7, 0xa9, 0x35, 0xff, 0x70 } };
+
+static int img_size(const BYTE *data, DWORD n, int *w, int *h) {
+    IStream *st; IWICBitmapDecoder *dec = NULL; IWICBitmapFrameDecode *fr = NULL; UINT W = 0, H = 0; int ok = 0;
+    if (!g_wic && FAILED(CoCreateInstance(&MY_CLSID_WIC, NULL, CLSCTX_INPROC_SERVER, &MY_IID_WICF, (void **)&g_wic))) return 0;
+    if (!data || !n || !(st = SHCreateMemStream(data, n))) return 0;
+    if (SUCCEEDED(g_wic->lpVtbl->CreateDecoderFromStream(g_wic, st, NULL, WICDecodeMetadataCacheOnDemand, &dec)) &&
+        SUCCEEDED(dec->lpVtbl->GetFrame(dec, 0, &fr)) && SUCCEEDED(fr->lpVtbl->GetSize(fr, &W, &H)) && W && H) { *w = (int)W; *h = (int)H; ok = 1; }
+    if (fr) fr->lpVtbl->Release(fr);
+    if (dec) dec->lpVtbl->Release(dec);
+    st->lpVtbl->Release(st);
+    return ok;
+}
+static void img_clear(void) { int i; for (i = 0; i < g_nimg; i++) free(g_img[i].data); g_nimg = 0; }
+static int img_get(const wchar_t *key, int kind) {
+    int i; Img *m;
+    for (i = 0; i < g_nimg; i++) if (_wcsicmp(g_img[i].key, key) == 0) return i;
+    if (g_nimg == g_capimg) { g_capimg = g_capimg * 2 + 16; g_img = (Img *)realloc(g_img, g_capimg * sizeof(Img)); }
+    m = &g_img[g_nimg]; ZeroMemory(m, sizeof *m); lstrcpynW(m->key, key, 1100);
+    if (kind == 1) {
+        m->data = read_all(key, 64u << 20, &m->n);
+        m->state = (m->data && img_size(m->data, m->n, &m->w, &m->h)) ? 1 : 2;
+    } else start_net(key, WM_APP_IMG);
+    return g_nimg++;
+}
+/* obrazok z webu dorazil (hlavne vlakno) */
+static void img_arrived(NetJob *j) {
+    int i;
+    for (i = 0; i < g_nimg; i++) if (_wcsicmp(g_img[i].key, j->url) == 0 && g_img[i].state == 0) {
+        Img *m = &g_img[i];
+        if (j->data && img_size(j->data, j->n, &m->w, &m->h)) { m->data = j->data; m->n = j->n; m->state = 1; j->data = NULL; }
+        else m->state = 2;
+        break;
+    }
+    free(j->data); free(j);
+}
+/* nahradi znak na pozicii cp obrazkom (dlzka textu sa nemeni) */
+static void insert_image(int cp, const ImgUse *u) {
+    RICHEDIT_IMAGE_PARAMETERS ip; IStream *st = NULL; CHARRANGE cr; HRESULT hr = E_FAIL; Img *m = &g_img[u->idx];
+    cr.cpMin = cp; cr.cpMax = cp + 1;
+    SendMessageW(hView, EM_EXSETSEL, 0, (LPARAM)&cr);
+    SendMessageW(hView, EM_REPLACESEL, FALSE, (LPARAM)L"");
+    if (m->state == 1 && (st = SHCreateMemStream(m->data, m->n)) != NULL) {
+        ZeroMemory(&ip, sizeof ip);
+        ip.xWidth = u->w; ip.yHeight = u->h; ip.Ascent = u->h; ip.Type = TA_BASELINE;
+        ip.pwszAlternateText = L"obrázok"; ip.pIStream = st;
+        hr = (HRESULT)SendMessageW(hView, EM_INSERTIMAGE, 0, (LPARAM)&ip);
+        st->lpVtbl->Release(st);
+    }
+    if (FAILED(hr)) SendMessageW(hView, EM_REPLACESEL, FALSE, (LPARAM)L"\x25A1");
+}
+
+/* ---------- drag & drop suborov a odkazov (vlastny OLE drop target) ----------
+   RichEdit si registruje vlastny drop target, ktory subory neprijima; nahradzame ho tymto.
+   Prijima subory z Prieskumnika aj webove odkazy pretiahnute z prehliadaca. */
 #define WM_APP_DROP (WM_APP + 1)
-static wchar_t g_dropPath[1024];
+static wchar_t g_dropPath[1100];
 static int g_dropOk;
 static FORMATETC g_fmtDrop = { CF_HDROP, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL };
+static int drop_url(IDataObject *d, wchar_t *out, int cap) {
+    static UINT cfUrl; FORMATETC f = { 0, NULL, DVASPECT_CONTENT, -1, TYMED_HGLOBAL }; STGMEDIUM m; wchar_t t[1100], *p; int ok = 0;
+    if (!cfUrl) cfUrl = RegisterClipboardFormatW(L"UniformResourceLocatorW");
+    f.cfFormat = (CLIPFORMAT)cfUrl;
+    if (FAILED(d->lpVtbl->GetData(d, &f, &m))) { f.cfFormat = CF_UNICODETEXT; if (FAILED(d->lpVtbl->GetData(d, &f, &m))) return 0; }
+    if ((p = (wchar_t *)GlobalLock(m.hGlobal)) != NULL) {
+        while (*p == ' ' || *p == '\r' || *p == '\n' || *p == '\t') p++;
+        lstrcpynW(t, p, 1100); GlobalUnlock(m.hGlobal);
+        if ((p = wcspbrk(t, L"\r\n \t")) != NULL) *p = 0;
+        ok = is_url(t);
+        if (ok && out) lstrcpynW(out, t, cap);
+    }
+    ReleaseStgMedium(&m);
+    return ok;
+}
 static HRESULT STDMETHODCALLTYPE DT_QI(IDropTarget *t, REFIID r, void **o) {
     if (IsEqualIID(r, &IID_IUnknown) || IsEqualIID(r, &IID_IDropTarget)) { *o = t; return S_OK; }
     *o = NULL; return E_NOINTERFACE;
@@ -157,7 +400,7 @@ static ULONG STDMETHODCALLTYPE DT_AddRef(IDropTarget *t) { (void)t; return 2; }
 static ULONG STDMETHODCALLTYPE DT_Release(IDropTarget *t) { (void)t; return 1; }
 static HRESULT STDMETHODCALLTYPE DT_Enter(IDropTarget *t, IDataObject *d, DWORD ks, POINTL pt, DWORD *eff) {
     (void)t; (void)ks; (void)pt;
-    g_dropOk = d && d->lpVtbl->QueryGetData(d, &g_fmtDrop) == S_OK;
+    g_dropOk = d && (d->lpVtbl->QueryGetData(d, &g_fmtDrop) == S_OK || drop_url(d, NULL, 0));
     *eff = g_dropOk ? DROPEFFECT_COPY : DROPEFFECT_NONE; return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE DT_Over(IDropTarget *t, DWORD ks, POINTL pt, DWORD *eff) {
@@ -176,7 +419,7 @@ static HRESULT STDMETHODCALLTYPE DT_Drop(IDropTarget *t, IDataObject *d, DWORD k
             GlobalUnlock(m.hGlobal);
         }
         ReleaseStgMedium(&m);
-    }
+    } else if (d && drop_url(d, g_dropPath, 1100)) { PostMessageW(hMain, WM_APP_DROP, 0, 0); *eff = DROPEFFECT_COPY; }
     return S_OK;
 }
 static IDropTargetVtbl g_dtVtbl = { DT_QI, DT_AddRef, DT_Release, DT_Enter, DT_Over, DT_Leave, DT_Drop };
@@ -245,6 +488,146 @@ static void emit_link(SB *b, const wchar_t *text, int tn, const wchar_t *url, in
     sb_f(b, "\\u%d?}", (int)(short)S_LINK_B);
 }
 
+static void sb_ws(SB *b, const wchar_t *s, int n) { int i; if (n < 0) n = (int)wcslen(s); for (i = 0; i < n; i++) sb_wc(b, s[i]); }
+static void img_note(SB *b, const wchar_t *msg, const wchar_t *what, int wn) {
+    sb_s(b, "{\\i\\cf6 ["); sb_ws(b, msg, -1);
+    if (what && wn > 0) { sb_s(b, ": "); sb_ws(b, what, wn); }
+    sb_s(b, "]}");
+}
+/* wantPx: >0 sirka v px, <0 percento sirky, 0 prirodzena velkost */
+static void emit_image(SB *b, const wchar_t *src, int sn, const wchar_t *alt, int an, int wantPx) {
+    wchar_t loc[1100]; int kind, k; Img *m; double tw, th, mx;
+    while (sn > 0 && is_sp(*src)) { src++; sn--; }
+    while (sn > 0 && is_sp(src[sn - 1])) sn--;
+    if (sn > 0 && src[0] == '<') { k = 1; while (k < sn && src[k] != '>') k++; src++; sn = k - 1; }
+    else { k = 0; while (k < sn && !is_sp(src[k])) k++; sn = k; }          /* bez "titulku" */
+    if (sn <= 0) { img_note(b, L"obrázok", alt, an); return; }
+    kind = resolve_ref(src, sn, loc, 1100);
+    if (!kind) { img_note(b, L"obrázok sa zobrazí po uložení dokumentu", src, sn); return; }
+    k = img_get(loc, kind); m = &g_img[k];
+    if (m->state == 0) { img_note(b, L"načítavam obrázok\x2026", NULL, 0); return; }
+    if (m->state == 2) { img_note(b, kind == 1 ? L"obrázok sa nenašiel" : L"obrázok sa nepodarilo stiahnuť", src, sn); return; }
+    mx = (g_cellTw > 0 ? g_cellTw : g_availTw - g_curLi) - 60; if (mx < 600) mx = 600;
+    tw = wantPx > 0 ? wantPx * 15.0 : wantPx < 0 ? mx * -wantPx / 100.0 : m->w * 15.0;   /* 1 px = 15 twips */
+    th = tw * m->h / m->w;
+    if (tw > mx) { th = th * mx / tw; tw = mx; }
+    if (g_nuse == g_capuse) { g_capuse = g_capuse * 2 + 16; g_use = (ImgUse *)realloc(g_use, g_capuse * sizeof(ImgUse)); }
+    g_use[g_nuse].idx = k; g_use[g_nuse].w = (LONG)(tw * 2540 / 1440); g_use[g_nuse].h = (LONG)(th * 2540 / 1440); g_nuse++;
+    sb_f(b, "\\u%d?", (int)(short)S_IMG);
+}
+
+/* ---------- HTML znacky v texte ---------- */
+static int is_tag_ch(wchar_t c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'); }
+/* s[i] == '<': rozpozna znacku alebo komentar; nm = nazov ("!--" pre komentar), cl = uzatvaracia, end = index za '>' */
+static int tag_parse(const wchar_t *s, int i, int n, wchar_t *nm, int cap, int *cl, int *end) {
+    int j = i + 1, k = 0; wchar_t q = 0;
+    *cl = 0; nm[0] = 0;
+    if (j + 2 < n && s[j] == '!' && s[j + 1] == '-' && s[j + 2] == '-') {
+        for (j += 3; j + 2 < n; j++) if (s[j] == '-' && s[j + 1] == '-' && s[j + 2] == '>') { lstrcpynW(nm, L"!--", cap); *end = j + 3; return 1; }
+        return 0;
+    }
+    if (j < n && s[j] == '/') { *cl = 1; j++; }
+    if (j >= n || !((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z'))) return 0;
+    while (j < n && is_tag_ch(s[j]) && k < cap - 1) nm[k++] = s[j++];
+    nm[k] = 0;
+    if (j < n && !is_sp(s[j]) && s[j] != '>' && s[j] != '/') return 0;
+    for (; j < n; j++) {
+        if (q) { if (s[j] == q) q = 0; }
+        else if (s[j] == '"' || s[j] == '\'') q = s[j];
+        else if (s[j] == '>') { *end = j + 1; return 1; }
+        else if (s[j] == '<') return 0;
+    }
+    return 0;
+}
+static int tag_attr(const wchar_t *s, int a, int e, const wchar_t *name, wchar_t *out, int cap) {
+    int nl = (int)wcslen(name), j;
+    for (j = a + 1; j + nl < e; j++) {
+        if (is_sp(s[j - 1]) && _wcsnicmp(s + j, name, nl) == 0) {
+            int p = j + nl, k = 0; wchar_t q = 0;
+            while (p < e && is_sp(s[p])) p++;
+            if (p >= e || s[p] != '=') continue;
+            p++; while (p < e && is_sp(s[p])) p++;
+            if (p < e && (s[p] == '"' || s[p] == '\'')) q = s[p++];
+            while (p < e && k < cap - 1 && (q ? s[p] != q : (!is_sp(s[p]) && s[p] != '>'))) out[k++] = s[p++];
+            if (!q && k > 0 && out[k - 1] == '/') k--;
+            out[k] = 0; return 1;
+        }
+    }
+    return 0;
+}
+static const struct { const wchar_t *t; const char *on, *off; } TAG_FMT[] = {
+    { L"b", "\\b ", "\\b0 " }, { L"strong", "\\b ", "\\b0 " }, { L"i", "\\i ", "\\i0 " }, { L"em", "\\i ", "\\i0 " },
+    { L"u", "\\ul ", "\\ulnone " }, { L"ins", "\\ul ", "\\ulnone " }, { L"s", "\\strike ", "\\strike0 " },
+    { L"del", "\\strike ", "\\strike0 " }, { L"strike", "\\strike ", "\\strike0 " },
+    { L"sup", "\\super ", "\\nosupersub " }, { L"sub", "\\sub ", "\\nosupersub " }, { NULL, NULL, NULL } };
+/* znacky, ktore sa len vynechaju (obsah medzi nimi sa zobrazi) */
+static const wchar_t *const TAG_SKIP[] = { L"span", L"div", L"p", L"center", L"small", L"big", L"mark", L"details", L"summary",
+    L"font", L"section", L"article", L"kbd", L"code", L"tt", L"abbr", L"cite", L"figure", L"figcaption", L"picture", L"source",
+    L"hr", L"nav", L"header", L"footer", L"main", L"aside", L"dl", L"dt", L"dd", L"var", L"samp", L"q", NULL };
+static int tag_known(const wchar_t *nm) {
+    int i;
+    if (!wcscmp(nm, L"!--") || !_wcsicmp(nm, L"a") || !_wcsicmp(nm, L"img") || !_wcsicmp(nm, L"br")) return 1;
+    for (i = 0; TAG_FMT[i].t; i++) if (!_wcsicmp(nm, TAG_FMT[i].t)) return 1;
+    for (i = 0; TAG_SKIP[i]; i++) if (!_wcsicmp(nm, TAG_SKIP[i])) return 1;
+    return 0;
+}
+static int find_ci(const wchar_t *s, int from, int n, const wchar_t *pat) {
+    int k = (int)wcslen(pat), j;
+    for (j = from; j + k <= n; j++) if (_wcsnicmp(s + j, pat, k) == 0) return j;
+    return -1;
+}
+static void add_head(const wchar_t *slug) {
+    if (g_nheads == g_capheads) { g_capheads = g_capheads * 2 + 32; g_heads = (Head *)realloc(g_heads, g_capheads * sizeof(Head)); }
+    g_heads[g_nheads].pos = -1; lstrcpynW(g_heads[g_nheads].slug, slug, 128); g_nheads++;
+}
+/* spracuje znamu HTML znacku na s[i]; vrati index za nou, alebo -1 ak to nie je znama znacka */
+static int html_tag(SB *b, const wchar_t *s, int i, int n) {
+    wchar_t nm[16], v[1100]; int cl, e, k;
+    if (!tag_parse(s, i, n, nm, 16, &cl, &e) || !tag_known(nm)) return -1;
+    if (!wcscmp(nm, L"!--")) return e;
+    if (!_wcsicmp(nm, L"a")) {
+        if (cl) return e;
+        if (tag_attr(s, i, e, L"href", v, 1100)) {        /* <a href="...">text</a> */
+            int c2 = find_ci(s, e, n, L"</a>");
+            if (c2 >= 0) {
+                wchar_t u[1104];
+                if (wcschr(v, ' ')) _snwprintf(u, 1103, L"<%s>", v); else lstrcpynW(u, v, 1104);
+                u[1103] = 0;
+                emit_link(b, s + e, c2 - e, u, (int)wcslen(u));
+                return c2 + 4;
+            }
+            return e;
+        }
+        /* <a id="..."> / <a name="...">: neviditelna kotva, na ktoru vedu odkazy #... */
+        if ((tag_attr(s, i, e, L"id", v, 128) || tag_attr(s, i, e, L"name", v, 128)) && v[0]) {
+            add_head(v); sb_f(b, "\\u%d?", (int)(short)S_HEAD);
+        }
+        return e;
+    }
+    if (!_wcsicmp(nm, L"img")) {
+        wchar_t alt[256] = L"", wv[32]; int w = 0;
+        if (cl) return e;
+        tag_attr(s, i, e, L"alt", alt, 256);
+        if (tag_attr(s, i, e, L"width", wv, 32)) { w = _wtoi(wv); if (wcschr(wv, '%')) w = -w; }
+        if (tag_attr(s, i, e, L"src", v, 1100)) emit_image(b, v, (int)wcslen(v), alt, (int)wcslen(alt), w);
+        return e;
+    }
+    if (!_wcsicmp(nm, L"br")) { sb_s(b, "\\line "); return e; }
+    for (k = 0; TAG_FMT[k].t; k++) if (!_wcsicmp(nm, TAG_FMT[k].t)) { sb_s(b, cl ? TAG_FMT[k].off : TAG_FMT[k].on); return e; }
+    return e;   /* TAG_SKIP */
+}
+/* odsek obsahuje len neviditelne znacky (kotvy, komentare, <div>...) */
+static int only_tags(const wchar_t *s, int n) {
+    int i = 0, cl, e; wchar_t nm[16], v[8];
+    while (i < n) {
+        if (is_sp(s[i]) || s[i] == S_BREAK) { i++; continue; }
+        if (s[i] == '<' && tag_parse(s, i, n, nm, 16, &cl, &e) && tag_known(nm) && _wcsicmp(nm, L"img") && _wcsicmp(nm, L"br")
+            && !(!_wcsicmp(nm, L"a") && !cl && tag_attr(s, i, e, L"href", v, 8))) { i = e; continue; }
+        return 0;
+    }
+    return 1;
+}
+
 static void inl(SB *b, const wchar_t *s, int n) {
     int i = 0;
     while (i < n) {
@@ -265,13 +648,8 @@ static void inl(SB *b, const wchar_t *s, int n) {
         if ((c == '!' && i + 1 < n && s[i + 1] == '[') || c == '[') {
             int img = (c == '!'), st = i + img, tEnd, us, ue, next;
             if (parse_link(s, st, n, &tEnd, &us, &ue, &next)) {
-                if (img) {
-                    const wchar_t *lbl = L"[obrázok"; int q;
-                    sb_s(b, "{\\i\\cf6 ");
-                    for (q = 0; lbl[q]; q++) sb_wc(b, lbl[q]);
-                    if (tEnd > st + 1) { sb_s(b, ": "); for (q = st + 1; q < tEnd; q++) sb_wc(b, s[q]); }
-                    sb_s(b, "]}");
-                } else emit_link(b, s + st + 1, tEnd - st - 1, s + us, ue - us);
+                if (img) emit_image(b, s + us, ue - us, s + st + 1, tEnd - st - 1, 0);
+                else emit_link(b, s + st + 1, tEnd - st - 1, s + us, ue - us);
                 i = next; continue;
             }
             sb_wc(b, c); i++; continue;
@@ -283,6 +661,7 @@ static void inl(SB *b, const wchar_t *s, int n) {
                 for (j = i + 1; j < n && s[j] != '>' && !is_sp(s[j]); j++) { }
                 if (j < n && s[j] == '>') { emit_link(b, s + i + 1, j - i - 1, s + i + 1, j - i - 1); i = j + 1; continue; }
             }
+            if ((j = html_tag(b, s, i, n)) > i) { i = j; continue; }
             sb_wc(b, c); i++; continue;
         }
         if (c == 'h' && !g_inLink && (i == 0 || !is_alnum_w(s[i - 1])) &&
@@ -538,7 +917,9 @@ static void emit_table(SB *b, Line *L, int i0, int i1, int li) {
         for (c = 0; c < nc; c++) {
             sb_f(b, "\\pard\\intbl\\%s\\sl276\\slmult1{\\plain\\f0\\fs%d\\cf1 %s", al[c] == 1 ? "qc" : al[c] == 2 ? "qr" : "ql", g_fs, hdr ? "\\b " : "");
             if (c == 0) emit_blk(b, L[r].s);
+            g_cellTw = wd[c] - 2 * FS(110); g_curLi = li;
             if (c < k) inl(b, L[r].s + cs[c], ce[c] - cs[c]);
+            g_cellTw = 0;
             sb_s(b, "}\\cell ");
         }
         sb_s(b, "\\row\n");
@@ -564,6 +945,14 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
     while (i < n) {
         Line l = L[i]; int off, h, fk, foff; wchar_t fc; LI it;
         if (ln_blank(l)) { i++; continue; }
+        {   /* HTML komentar cez viac riadkov <!-- ... --> sa nezobrazuje */
+            int o; ln_indent(l, &o);
+            if (l.len - o >= 4 && !wcsncmp(l.s + o, L"<!--", 4)) {
+                int j = i, f = -1;
+                for (; j < n && f < 0; j++) f = find_ci(L[j].s, j == i ? o + 4 : 0, L[j].len, L"-->");
+                if (f >= 0 && j - 1 > i) { i = j; continue; }
+            }
+        }
         if (ln_fence(l, &fc, &fk, &foff)) {
             int j, first = 1, right = g_availTw; if (right < li + 1200) right = li + 1200;
             depth = 0;
@@ -592,6 +981,7 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
             sb_f(b, "\\pard\\plain\\f0\\b\\fs%d\\cf%d\\li%d\\sb%d\\sa%d\\keepn \\u%d?", FS(hs[h - 1]), cf, li,
                  h <= 2 ? FS(280) : FS(220), h <= 2 ? FS(60) : FS(110), (int)(short)S_HEAD);
             emit_blk(b, l.s);
+            g_curLi = li;
             inl(b, l.s + a, e - a);
             sb_s(b, "\\par\n");
             if (h <= 2) emit_rule(b, li);
@@ -629,6 +1019,7 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
             emit_blk(b, l.s);
             for (k = 0; mk[k]; k++) sb_wc(b, mk[k]);
             sb_s(b, "\\tab ");
+            g_curLi = lii;
             inl(b, w.p + a, w.n - a);
             sb_s(b, "\\par\n");
             i = j; continue;
@@ -644,14 +1035,162 @@ static void blocks(SB *b, Line *L, int n, int li, int quote) {
             do { para_add(&w, L[j].s, L[j].len); j++; }
             while (j < n && !ln_blank(L[j]) && !starts_block(L[j]) && !table_at(L, j, n));
             para_trim(&w);
-            sb_f(b, "\\pard\\plain\\f0\\fs%d\\cf%d\\sl276\\slmult1\\li%d\\sa%d ", g_fs, cf, li, FS(160));
-            emit_blk(b, L[i].s);
-            inl(b, w.p, w.n);
+            {   SB t = { 0 }; int nu = g_nuse;
+                g_curLi = li;
+                emit_blk(&t, L[i].s);
+                inl(&t, w.p, w.n);
+                if (only_tags(w.p, w.n))   /* napr. samotna kotva <a id="..."></a>: bez medzery v texte */
+                    sb_f(b, "\\pard\\plain\\f0\\fs2\\li%d\\sa0\\sb0 ", li);
+                else   /* s obrazkom jednoduche riadkovanie, inak by pod nim ostala velka medzera */
+                    sb_f(b, "\\pard\\plain\\f0\\fs%d\\cf%d%s\\li%d\\sa%d ", g_fs, cf, g_nuse > nu ? "" : "\\sl276\\slmult1", li, FS(160));
+                if (t.p) sb_s(b, t.p);
+                free(t.p);
+            }
             sb_s(b, "\\par\n");
             i = j;
         }
     }
     free(w.p);
+}
+
+/* ---------- ulozene odkazy a naposledy otvorene ----------
+   Ukladaju sa do %APPDATA%\MDView\odkazy.txt (UTF-8, riadok = typ<TAB>nazov<TAB>umiestnenie). */
+typedef struct { wchar_t name[200], loc[1100]; } Ref;
+#define MAXBM 200
+#define MAXRC 12
+static Ref g_bm[MAXBM], g_rc[MAXRC]; static int g_nbm, g_nrc;
+static int refs_file(wchar_t *out) {
+    wchar_t d[MAX_PATH];
+#ifdef MDV_TEST
+    if (_wgetenv(L"MDV_TEST_REFS")) { lstrcpynW(out, _wgetenv(L"MDV_TEST_REFS"), 1100); return 1; }
+#endif
+    if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, d))) return 0;
+    _snwprintf(out, 1099, L"%s\\MDView", d); out[1099] = 0;
+    CreateDirectoryW(out, NULL);
+    wcscat(out, L"\\odkazy.txt");
+    return 1;
+}
+static void refs_load(void) {
+    wchar_t f[1100], *w, *p; DWORD n; BYTE *buf; int wn;
+    g_nbm = g_nrc = 0;
+    if (!refs_file(f) || !(buf = read_all(f, 4u << 20, &n))) return;
+    wn = MultiByteToWideChar(CP_UTF8, 0, (char *)buf, n, NULL, 0);
+    w = (wchar_t *)malloc((wn + 1) * sizeof(wchar_t)); MultiByteToWideChar(CP_UTF8, 0, (char *)buf, n, w, wn); w[wn] = 0; free(buf);
+    for (p = w; *p; ) {
+        wchar_t *e = p, *t1, *t2;
+        while (*e && *e != '\n') e++;
+        if (*e) *e++ = 0;
+        { size_t L = wcslen(p); if (L && p[L - 1] == '\r') p[L - 1] = 0; }
+        if (p[0] == 0xFEFF) p++;
+        t1 = wcschr(p, '\t'); t2 = t1 ? wcschr(t1 + 1, '\t') : NULL;
+        if (t1 && t2 && t2[1]) {
+            Ref *r = NULL;
+            if (p[0] == 'B' && g_nbm < MAXBM) r = &g_bm[g_nbm++];
+            else if (p[0] == 'R' && g_nrc < MAXRC) r = &g_rc[g_nrc++];
+            if (r) { *t2 = 0; lstrcpynW(r->name, t1 + 1, 200); lstrcpynW(r->loc, t2 + 1, 1100); }
+        }
+        p = e;
+    }
+    free(w);
+}
+static void refs_save(void) {
+    wchar_t f[1100]; WB w = { 0 }; int i, bn; char *u; HANDLE h; DWORD wr;
+    if (!refs_file(f)) return;
+    wb_add(&w, L"", 0);
+    { const wchar_t *hd = L"# MD View: B = uložený odkaz, R = naposledy otvorený (typ<TAB>názov<TAB>umiestnenie)\r\n"; wb_add(&w, hd, (int)wcslen(hd)); }
+    for (i = 0; i < g_nbm + g_nrc; i++) {
+        Ref *r = i < g_nbm ? &g_bm[i] : &g_rc[i - g_nbm];
+        wb_add(&w, i < g_nbm ? L"B\t" : L"R\t", 2);
+        wb_add(&w, r->name, (int)wcslen(r->name)); wb_ch(&w, '\t');
+        wb_add(&w, r->loc, (int)wcslen(r->loc)); wb_add(&w, L"\r\n", 2);
+    }
+    bn = WideCharToMultiByte(CP_UTF8, 0, w.p, w.n, NULL, 0, NULL, NULL);
+    u = (char *)malloc(bn + 1); WideCharToMultiByte(CP_UTF8, 0, w.p, w.n, u, bn, NULL, NULL); free(w.p);
+    h = CreateFileW(f, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) { WriteFile(h, u, bn, &wr, NULL); CloseHandle(h); }
+    free(u);
+}
+static void ref_set(Ref *r, const wchar_t *name, const wchar_t *loc) {
+    wchar_t *p;
+    lstrcpynW(r->name, name && name[0] ? name : loc, 200); lstrcpynW(r->loc, loc, 1100);
+    for (p = r->name; *p; p++) if (*p == '\t' || *p == '\r' || *p == '\n') *p = ' ';
+}
+static int bm_find(const wchar_t *loc) {
+    int i; if (!loc || !loc[0]) return -1;
+    for (i = 0; i < g_nbm; i++) if (_wcsicmp(g_bm[i].loc, loc) == 0) return i;
+    return -1;
+}
+static void bm_add(const wchar_t *name, const wchar_t *loc) {
+    int i = bm_find(loc);
+    if (i < 0) { if (g_nbm >= MAXBM) return; i = g_nbm++; }
+    ref_set(&g_bm[i], name, loc); refs_save();
+}
+static void bm_del(int i) {
+    if (i < 0 || i >= g_nbm) return;
+    memmove(&g_bm[i], &g_bm[i + 1], (g_nbm - i - 1) * sizeof(Ref)); g_nbm--; refs_save();
+}
+static void recent_add(const wchar_t *name, const wchar_t *loc) {
+    int i;
+    for (i = 0; i < g_nrc; i++) if (_wcsicmp(g_rc[i].loc, loc) == 0) break;
+    if (i == g_nrc) i = g_nrc < MAXRC ? g_nrc++ : MAXRC - 1;
+    memmove(&g_rc[1], &g_rc[0], i * sizeof(Ref));
+    ref_set(&g_rc[0], name, loc); refs_save();
+}
+/* nazov dokumentu = prvy nadpis "# ..." */
+static void doc_title(const wchar_t *w, wchar_t *out, int cap) {
+    const wchar_t *p = w; int lines = 0;
+    out[0] = 0;
+    while (p && *p && lines < 400) {
+        const wchar_t *e = p, *q = p;
+        while (*e && *e != '\r' && *e != '\n') e++;
+        while (q < e && *q == ' ') q++;
+        if (e - q > 2 && q[0] == '#' && q[1] == ' ') {
+            int k = 0;
+            for (q += 2; q < e && k < cap - 1; q++) if (*q != '*' && *q != '_' && *q != '`') out[k++] = *q;
+            while (k > 0 && out[k - 1] == ' ') k--;
+            out[k] = 0; if (k) return;
+        }
+        p = e; if (*p == '\r') p++; if (*p == '\n') p++; lines++;
+    }
+}
+static void wb_s(WB *w, const wchar_t *s) { wb_add(w, s, (int)wcslen(s)); }
+static void wb_md(WB *w, const wchar_t *s) {   /* text bez markdown formatovania */
+    for (; *s; s++) { if (wcschr(L"\\`*_[]<>|#~!", *s)) wb_ch(w, '\\'); wb_ch(w, *s); }
+}
+static void wb_code(WB *w, const wchar_t *s) {
+    wb_ch(w, '`'); for (; *s; s++) wb_ch(w, *s == '`' ? '\'' : *s); wb_ch(w, '`');
+}
+/* uvodna stranka (ked nie je otvoreny ziadny dokument) */
+static wchar_t *build_home(int *outn) {
+    WB w = { 0 }; int i; wchar_t t[32];
+    wb_s(&w, L"# MD View\n\n");
+    wb_s(&w, L"[Otvoriť súbor](mdview:open) \x00B7 [Otvoriť webovú adresu](mdview:url) \x00B7 [Pridať odkaz](mdview:add) \x00B7 [Návod](mdview:help)\n\n");
+    wb_s(&w, L"Dokument môžete aj **pretiahnuť do okna** \x2014 súbor z Prieskumníka alebo odkaz z prehliadača.\n\n");
+    wb_s(&w, L"## Uložené odkazy\n\n");
+    if (!g_nbm) wb_s(&w, L"*Zatiaľ nemáte uložené žiadne odkazy.* Otvorte dokument a kliknite na **\x2606** v hornom paneli, alebo použite [Pridať odkaz](mdview:add).\n\n");
+    else {
+        wb_s(&w, L"| | Názov | Umiestnenie | |\n| :-: | :-- | :-- | :-: |\n");
+        for (i = 0; i < g_nbm; i++) {
+            wb_s(&w, is_url(g_bm[i].loc) ? L"| web | [" : L"| PC | [");
+            wb_md(&w, g_bm[i].name);
+            _snwprintf(t, 31, L"](mdview:bm?%d) | ", i); t[31] = 0; wb_s(&w, t);
+            wb_code(&w, g_bm[i].loc);
+            _snwprintf(t, 31, L" | [odstrániť](mdview:del?%d) |\n", i); t[31] = 0; wb_s(&w, t);
+        }
+        wb_s(&w, L"\n");
+    }
+    if (g_nrc) {
+        wb_s(&w, L"## Naposledy otvorené\n\n");
+        for (i = 0; i < g_nrc; i++) {
+            wb_s(&w, L"- [");
+            wb_md(&w, g_rc[i].name);
+            _snwprintf(t, 31, L"](mdview:rc?%d) \x2014 ", i); t[31] = 0; wb_s(&w, t);
+            wb_code(&w, g_rc[i].loc); wb_s(&w, L"\n");
+        }
+        wb_s(&w, L"\n");
+    }
+    wb_s(&w, HOME_KEYS);
+    *outn = w.n; return w.p;
 }
 
 /* ---------- vykreslenie ---------- */
@@ -662,9 +1201,9 @@ typedef struct { int pos; wchar_t c; } SPos;
 static int spos_cmp(const void *a, const void *b) { return ((const SPos *)a)->pos - ((const SPos *)b)->pos; }
 static void post_sentinels(void) {
     /* pozicie hladame cez EM_FINDTEXTEX, aby sedeli s indexmi RichEditu aj v tabulkach */
-    static const wchar_t sent[4] = { S_LINK_A, S_LINK_B, S_HEAD, S_BLOCK };
-    int i, k, removed = 0, li_ = 0, hi_ = 0, bi_ = 0, np = 0, cap = 0; SPos *pos = NULL;
-    for (k = 0; k < 4; k++) {
+    static const wchar_t sent[5] = { S_LINK_A, S_LINK_B, S_HEAD, S_BLOCK, S_IMG };
+    int i, k, removed = 0, li_ = 0, hi_ = 0, bi_ = 0, np = 0, cap = 0, nimg = 0, ui; SPos *pos = NULL;
+    for (k = 0; k < 5; k++) {
         wchar_t needle[2]; FINDTEXTEXW ft; int from = 0;
         needle[0] = sent[k]; needle[1] = 0;
         for (;;) {
@@ -678,14 +1217,21 @@ static void post_sentinels(void) {
     if (np) qsort(pos, np, sizeof(SPos), spos_cmp);
     for (i = 0; i < np; i++) {
         int p = pos[i].pos - removed; wchar_t c = pos[i].c;
+        if (c == S_IMG) { nimg++; continue; }   /* obrazok zaberie rovnako 1 znak, posun nevznika */
         if (c == S_LINK_A) { if (li_ < g_nlinks) g_links[li_].a = p; }
         else if (c == S_LINK_B) { if (li_ < g_nlinks) g_links[li_++].b = p; }
         else if (c == S_BLOCK) { if (bi_ < g_nblk) g_blk[bi_++].cp = p; }
         else if (hi_ < g_nheads) g_heads[hi_++].pos = p;
         removed++;
     }
+    ui = nimg - 1;
     for (i = np - 1; i >= 0; i--) {
         CHARRANGE cr; cr.cpMin = pos[i].pos; cr.cpMax = pos[i].pos + 1;
+        if (pos[i].c == S_IMG) {
+            if (ui >= 0 && ui < g_nuse) insert_image(pos[i].pos, &g_use[ui]);
+            else { SendMessageW(hView, EM_EXSETSEL, 0, (LPARAM)&cr); SendMessageW(hView, EM_REPLACESEL, FALSE, (LPARAM)L"\x25A1"); }
+            ui--; continue;
+        }
         SendMessageW(hView, EM_EXSETSEL, 0, (LPARAM)&cr);
         SendMessageW(hView, EM_REPLACESEL, FALSE, (LPARAM)L"");
     }
@@ -783,8 +1329,8 @@ static void render(int resetScroll) {
     src = g_help ? load_help(&n) : NULL;
     fromEd = (src == NULL);
     if (!src) src = get_text(hEdit, 0, &n);
-    if (!g_help && n == 0 && !g_path[0] && !g_modified) { free(src); src = _wcsdup(WELCOME); n = (int)wcslen(src); fromEd = 0; }
-    for (i = 0; i < n; i++) if (src[i] >= S_LINK_A && src[i] <= S_BLOCK) src[i] = 0xFFFD;
+    if (!g_help && n == 0 && !g_path[0] && !g_modified) { free(src); src = build_home(&n); fromEd = 0; }
+    for (i = 0; i < n; i++) if (src[i] >= S_LINK_A && src[i] <= S_IMG) src[i] = 0xFFFD;
     for (i = 0; i <= n; ) {
         int s0 = i;
         while (i < n && src[i] != '\r' && src[i] != '\n') i++;
@@ -795,7 +1341,7 @@ static void render(int resetScroll) {
         i++;
     }
     for (i = 0; i < g_nlinks; i++) free(g_links[i].url);
-    g_nlinks = 0; g_nheads = 0; g_hasTable = 0; g_inLink = 0; g_nblk = 0;
+    g_nlinks = 0; g_nheads = 0; g_hasTable = 0; g_inLink = 0; g_nblk = 0; g_nuse = 0; g_cellTw = 0; g_curLi = 0;
     /* editor ma oddelovac riadkov '\r' (1 znak), takze posun v src = pozicia v editore */
     g_nLines = 0;
     if (fromEd) {
@@ -838,10 +1384,18 @@ static void render(int resetScroll) {
 
 /* ---------- subor ---------- */
 static void set_title(void) {
-    wchar_t t[1200]; const wchar_t *name = g_path[0] ? wcsrchr(g_path, '\\') : NULL;
-    name = name ? name + 1 : (g_path[0] ? g_path : L"Bez názvu");
-    _snwprintf(t, 1199, L"%s%s \x2014 %s", name, g_modified ? L" *" : L"", APP); t[1199] = 0;
+    wchar_t t[1200], nm[300];
+    if (g_path[0]) loc_name(g_path, nm, 300);
+    else if (g_modified || GetWindowTextLengthW(hEdit) > 0) wcscpy(nm, L"Bez názvu");
+    else { SetWindowTextW(hMain, APP); return; }
+    _snwprintf(t, 1199, L"%s%s%s \x2014 %s", nm, g_online ? L" (web)" : L"", g_modified ? L" *" : L"", APP); t[1199] = 0;
     SetWindowTextW(hMain, t);
+}
+static void star_update(void) {
+    if (!hBtn[13]) return;
+    SetWindowTextW(hBtn[13], bm_find(g_path) >= 0 ? L"\x2605" : L"\x2606");
+    EnableWindow(hBtn[13], g_path[0] != 0);
+    InvalidateRect(hBtn[13], NULL, TRUE);
 }
 static void set_modified(int m) { if (g_modified != m) { g_modified = m; set_title(); } }
 
@@ -853,13 +1407,9 @@ static void set_editor_text(const wchar_t *w) {
     g_loading = 0;
 }
 
-static int load_file(const wchar_t *path) {
-    HANDLE h; LARGE_INTEGER sz; BYTE *buf; DWORD rd = 0; wchar_t *w = NULL; int n = 0, wn = 0; wchar_t full[1024];
-    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
-    if (h == INVALID_HANDLE_VALUE) { MessageBoxW(hMain, L"Súbor sa nepodarilo otvoriť.", APP, MB_ICONWARNING); return 0; }
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart > 64 * 1024 * 1024) { CloseHandle(h); MessageBoxW(hMain, L"Súbor je príliš veľký.", APP, MB_ICONWARNING); return 0; }
-    n = (int)sz.QuadPart; buf = (BYTE *)malloc(n + 4);
-    ReadFile(h, buf, n, &rd, NULL); CloseHandle(h); n = (int)rd; buf[n] = buf[n + 1] = 0;
+/* bajty suboru -> text (UTF-8, UTF-16 alebo stredoeuropske kodovanie) */
+static wchar_t *decode_text(const BYTE *buf, int n) {
+    wchar_t *w = NULL; int wn = 0;
     if (n >= 2 && buf[0] == 0xFF && buf[1] == 0xFE) {
         wn = (n - 2) / 2; w = (wchar_t *)malloc((wn + 1) * sizeof(wchar_t)); memcpy(w, buf + 2, wn * 2);
     } else if (n >= 2 && buf[0] == 0xFE && buf[1] == 0xFF) {
@@ -875,15 +1425,79 @@ static int load_file(const wchar_t *path) {
         w = (wchar_t *)malloc((wn + 1) * sizeof(wchar_t));
         if (wn > 0) MultiByteToWideChar(cp, cp == CP_UTF8 ? MB_ERR_INVALID_CHARS : 0, p, len, w, wn);
     }
-    w[wn] = 0; free(buf);
+    w[wn] = 0;
+    return w;
+}
+/* zobrazi nacitany dokument; loc = cesta alebo webova adresa */
+static void show_doc(wchar_t *w, const wchar_t *loc, int online) {
+    wchar_t title[200];
     g_crlf = wcsstr(w, L"\r\n") != NULL || wcschr(w, '\n') == NULL;
-    if (!GetFullPathNameW(path, 1024, full, NULL)) wcsncpy(full, path, 1023);
-    full[1023] = 0; wcscpy(g_path, full);
-    set_editor_text(w); free(w);
+    lstrcpynW(g_path, loc, 1024); g_online = online;
+    set_editor_text(w);
     g_modified = 0; set_title();
     g_help = 0; if (hBtn[8]) InvalidateRect(hBtn[8], NULL, TRUE);
     render(1);
+    doc_title(w, title, 200); if (!title[0]) loc_name(loc, title, 200);
+    recent_add(title, loc);
+    star_update();
+}
+static int load_file(const wchar_t *path) {
+    DWORD n; BYTE *buf; wchar_t full[1024], *w;
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
+        wchar_t m[1200]; _snwprintf(m, 1199, L"Súbor sa nenašiel:\n%s", path); m[1199] = 0;
+        MessageBoxW(hMain, m, APP, MB_ICONWARNING); return 0;
+    }
+    if (!(buf = read_all(path, 64u << 20, &n))) { MessageBoxW(hMain, L"Súbor sa nepodarilo otvoriť (alebo je väčší ako 64 MB).", APP, MB_ICONWARNING); return 0; }
+    w = decode_text(buf, (int)n); free(buf);
+    if (!GetFullPathNameW(path, 1024, full, NULL)) lstrcpynW(full, path, 1024);
+    show_doc(w, full, 0); free(w);
     return 1;
+}
+static int confirm_discard(void);
+static void goto_anchor(const wchar_t *a);
+static wchar_t g_pendFrag[256];
+static int g_docBusy;
+/* otvori subor alebo webovu adresu; frag = kotva, na ktoru sa ma posunut */
+static void open_location(const wchar_t *loc0, const wchar_t *frag) {
+    wchar_t loc[1100];
+    if (!loc0 || !loc0[0] || !confirm_discard()) return;
+    if (is_url(loc0)) {
+        wchar_t t[2200];
+        if (g_docBusy) return;
+        normalize_url(loc0, t, 2200); url_encode(t, loc, 1100);
+        g_docBusy = 1; lstrcpynW(g_pendFrag, frag ? frag : L"", 256);
+        SetWindowTextW(hMain, L"Načítavam\x2026 \x2014 " APP);
+        start_net(loc, WM_APP_DOC);
+    } else {
+        lstrcpynW(loc, loc0, 1100);
+        if (load_file(loc) && frag && frag[0]) goto_anchor(frag);
+    }
+}
+static int looks_html(const BYTE *b, DWORD n) {
+    DWORD i = 0; char t[16]; int k = 0;
+    if (n >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) i = 3;
+    while (i < n && (b[i] == ' ' || b[i] == '\r' || b[i] == '\n' || b[i] == '\t')) i++;
+    while (i < n && k < 14) t[k++] = (char)tolower(b[i++]);
+    t[k] = 0;
+    return !strncmp(t, "<!doctype html", 14) || !strncmp(t, "<html", 5);
+}
+/* webovy dokument dorazil (hlavne vlakno) */
+static void doc_arrived(NetJob *j) {
+    g_docBusy = 0;
+    if (!j->data) {
+        wchar_t m[1400];
+        if (j->status) _snwprintf(m, 1399, L"Dokument sa nepodarilo stiahnuť (server vrátil chybu %lu).\n\n%s", (unsigned long)j->status, j->url);
+        else _snwprintf(m, 1399, L"Dokument sa nepodarilo stiahnuť. Skontrolujte adresu a pripojenie na internet.\n\n%s", j->url);
+        m[1399] = 0; set_title(); MessageBoxW(hMain, m, APP, MB_ICONWARNING);
+    } else if (looks_html(j->data, j->n)) {
+        set_title();
+        MessageBoxW(hMain, L"Na tejto adrese je webová stránka, nie súbor Markdown.\n\nPoužite odkaz priamo na súbor \x2014 napríklad na GitHube tlačidlo „Raw“.", APP, MB_ICONWARNING);
+    } else {
+        wchar_t *w = decode_text(j->data, (int)j->n);
+        show_doc(w, j->url, 1); free(w);
+        if (g_pendFrag[0]) goto_anchor(g_pendFrag);
+    }
+    free(j->data); free(j);
 }
 
 static int save_to(const wchar_t *path) {
@@ -901,16 +1515,22 @@ static int save_to(const wchar_t *path) {
 }
 static const wchar_t FILTER[] = L"Markdown (*.md;*.markdown)\0*.md;*.markdown\0Text (*.txt)\0*.txt\0Všetky súbory (*.*)\0*.*\0";
 static int do_save(int saveAs) {
-    wchar_t path[1024];
+    wchar_t path[1024], *p;
     wcscpy(path, g_path);
-    if (saveAs || !path[0]) {
+    if (g_online) {   /* dokument z webu sa uklada ako novy subor v pocitaci */
+        loc_name(g_path, path, 1024);
+        for (p = path; *p; p++) if (wcschr(L"\\/:*?\"<>|", *p)) *p = '_';
+    }
+    if (saveAs || !path[0] || g_online) {
         OPENFILENAMEW of; ZeroMemory(&of, sizeof of);
         of.lStructSize = sizeof of; of.hwndOwner = hMain; of.lpstrFilter = FILTER; of.lpstrFile = path; of.nMaxFile = 1024;
         of.lpstrDefExt = L"md"; of.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
         if (!GetSaveFileNameW(&of)) return 0;
     }
     if (!save_to(path)) return 0;
-    wcscpy(g_path, path); g_modified = 0; set_title();
+    { int wasOnline = g_online; wcscpy(g_path, path); g_online = 0; g_modified = 0; set_title();
+      if (wasOnline || saveAs) { wchar_t nm[200]; loc_name(path, nm, 200); recent_add(nm, path); }
+      star_update(); }
     return 1;
 }
 static int confirm_discard(void) {
@@ -928,6 +1548,18 @@ static void do_open(void) {
     if (!confirm_discard()) return;
     if (GetOpenFileNameW(&of)) load_file(path);
 }
+static void set_edit_mode(int on);
+static void set_help(int on);
+/* zavrie dokument (nie aplikaciu) a ukaze uvodnu stranku s odkazmi */
+static void go_home(void) {
+    if (!confirm_discard()) return;
+    g_path[0] = 0; g_online = 0; g_modified = 0; g_help = 0;
+    set_editor_text(L"");
+    if (hBtn[8]) InvalidateRect(hBtn[8], NULL, TRUE);
+    set_title(); star_update();
+    if (g_edit) set_edit_mode(0);
+    render(1);
+}
 
 /* ---------- odkazy ---------- */
 static void scroll_to_cp(int cp, int topPad) {
@@ -937,10 +1569,23 @@ static void scroll_to_cp(int cp, int topPad) {
     sp.y += p.y - topPad; if (sp.y < 0) sp.y = 0;
     SendMessageW(hView, EM_SETSCROLLPOS, 0, (LPARAM)&sp);
 }
-static void goto_anchor(const wchar_t *a) {
-    int i;
+/* kotva bez diakritiky, pomlciek a velkosti pismen (zachrana, ak sa presny tvar lisi) */
+static void anchor_norm(const wchar_t *s, wchar_t *o, int cap) {
+    int k = 0;
+    for (; *s && k < cap - 1; s++) { wchar_t c = fold_ch(*s); if (is_alnum_w(c)) o[k++] = c; }
+    o[k] = 0;
+}
+static void goto_anchor(const wchar_t *a0) {
+    wchar_t a[256], na[256], nh[256]; int i;
+    url_decode(a0, a, 256);
     for (i = 0; i < g_nheads; i++)
         if (g_heads[i].pos >= 0 && _wcsicmp(g_heads[i].slug, a) == 0) { scroll_to_cp(g_heads[i].pos, S(8)); return; }
+    anchor_norm(a, na, 256);
+    if (!na[0]) return;
+    for (i = 0; i < g_nheads; i++) {
+        anchor_norm(g_heads[i].slug, nh, 256);
+        if (g_heads[i].pos >= 0 && !wcscmp(na, nh)) { scroll_to_cp(g_heads[i].pos, S(8)); return; }
+    }
 }
 static int link_at(POINT pt) {
     POINTL pl, p1, p2; int cp, i;
@@ -959,32 +1604,38 @@ static int link_at(POINT pt) {
     }
     return -1;
 }
+/* lokalne subory inych typov sa otvoria v ich programe, ale len bezpecne typy (nie .exe, .bat...) */
+static int safe_ext(const wchar_t *p) {
+    static const wchar_t *const ok[] = { L".pdf", L".png", L".jpg", L".jpeg", L".gif", L".webp", L".bmp", L".svg", L".txt", L".csv",
+        L".doc", L".docx", L".xls", L".xlsx", L".ppt", L".pptx", L".odt", L".ods", L".rtf", L".mp3", L".mp4", L".wav", L".mov", L".srt", NULL };
+    const wchar_t *e = wcsrchr(p, '.'); int i;
+    if (GetFileAttributesW(p) & FILE_ATTRIBUTE_DIRECTORY) return 1;
+    if (!e) return 0;
+    for (i = 0; ok[i]; i++) if (!_wcsicmp(e, ok[i])) return 1;
+    return 0;
+}
+static void home_cmd(const wchar_t *cmd);
 static void open_link(const wchar_t *url) {
-    int n = (int)wcslen(url), i, k = 0; wchar_t rel[1024], full[1024], *frag = NULL, *ext;
-    if (starts_i(url, n, L"http://") || starts_i(url, n, L"https://") || starts_i(url, n, L"mailto:")) {
-        ShellExecuteW(hMain, L"open", url, NULL, NULL, SW_SHOWNORMAL); return;
-    }
+    int n = (int)wcslen(url), kind; wchar_t u[1100], frag[256] = L"", loc[1100], *h;
+    if (starts_i(url, n, L"mdview:")) { home_cmd(url + 7); return; }
+    if (starts_i(url, n, L"mailto:")) { ShellExecuteW(hMain, L"open", url, NULL, NULL, SW_SHOWNORMAL); return; }
     if (url[0] == '#') { goto_anchor(url + 1); return; }
-    for (i = 0; i < n && k < 1000; i++) {
-        wchar_t c = url[i];
-        if (c == '%' && i + 2 < n && iswxdigit(url[i + 1]) && iswxdigit(url[i + 2])) {
-            wchar_t hx[3] = { url[i + 1], url[i + 2], 0 }; c = (wchar_t)wcstol(hx, NULL, 16); i += 2;
+    lstrcpynW(u, url, 1100);
+    if ((h = wcschr(u, '#')) != NULL) { lstrcpynW(frag, h + 1, 256); *h = 0; }
+    kind = resolve_ref(u, (int)wcslen(u), loc, 1100);
+    if (kind == 2) {                                   /* webova adresa */
+        if (has_md_ext(loc)) open_location(loc, frag);  /* dalsi Markdown dokument -> priamo v aplikacii */
+        else {
+            if (frag[0] && wcslen(loc) + wcslen(frag) < 1098) { wcscat(loc, L"#"); wcscat(loc, frag); }
+            ShellExecuteW(hMain, L"open", loc, NULL, NULL, SW_SHOWNORMAL);
         }
-        rel[k++] = c == '/' ? '\\' : c;
+    } else if (kind == 1) {                            /* subor v pocitaci */
+        if (GetFileAttributesW(loc) == INVALID_FILE_ATTRIBUTES) {
+            wchar_t m[1200]; _snwprintf(m, 1199, L"Súbor sa nenašiel:\n%s", loc); m[1199] = 0;
+            MessageBoxW(hMain, m, APP, MB_ICONWARNING);
+        } else if (has_md_ext(loc)) open_location(loc, frag);
+        else if (safe_ext(loc)) ShellExecuteW(hMain, L"open", loc, NULL, NULL, SW_SHOWNORMAL);
     }
-    rel[k] = 0;
-    frag = wcschr(rel, '#'); if (frag) *frag++ = 0;
-    if ((rel[0] && rel[1] == ':') || (rel[0] == '\\' && rel[1] == '\\')) wcscpy(full, rel);
-    else {
-        wchar_t *sl; if (!g_path[0]) return;
-        wcscpy(full, g_path); sl = wcsrchr(full, '\\'); if (!sl) return; sl[1] = 0;
-        if (wcslen(full) + wcslen(rel) >= 1023) return;
-        wcscat(full, rel);
-    }
-    ext = wcsrchr(full, '.');
-    if (!ext || (_wcsicmp(ext, L".md") && _wcsicmp(ext, L".markdown") && _wcsicmp(ext, L".txt"))) return;
-    if (GetFileAttributesW(full) == INVALID_FILE_ATTRIBUTES) return;
-    if (confirm_discard() && load_file(full) && frag) goto_anchor(frag);
 }
 
 /* ---------- hladanie ---------- */
@@ -1135,19 +1786,25 @@ static void editor_format(void) {
     g_loading = 0;
 }
 static void layout(void) {
-    RECT rc, r; int W, H, tb = S(44), bh = S(28), by, x, i;
-    static const int bw[6] = { 74, 68, 74, 74, 38, 38 };
+    RECT rc, r; int W, H, tb = S(44), bh = S(28), by, x, i, right, sw;
+    /* poradie tlacidiel zlava: index v hBtn, sirka, medzera za nim */
+    static const struct { int i, w, gap; } BL[] = {
+        { 11, 66, 6 }, { 0, 70, 6 }, { 12, 84, 6 }, { 13, 32, 14 },   /* Domov, Otvoriť, Odkazy ▾, ☆ */
+        { 1, 64, 6 }, { 2, 70, 14 },                                 /* Uložiť, Upraviť */
+        { 3, 64, 6 }, { 4, 36, 6 }, { 5, 36, 14 },                   /* Tmavý, A−, A+ */
+        { 8, 62, 6 } };                                              /* Návod */
     GetClientRect(hMain, &rc); W = rc.right; H = rc.bottom; by = (tb - bh) / 2; x = S(8);
-    for (i = 0; i < 6; i++) { MoveWindow(hBtn[i], x, by, S(bw[i]), bh, TRUE); x += S(bw[i]) + S(6); if (i == 3) x += S(8); }
-    MoveWindow(hBtn[8], x + S(8), by, S(68), bh, TRUE);
-    MoveWindow(hBtn[10], x + S(8) + S(68) + S(6), by, S(104), bh, TRUE);
-    x = W - S(8) - S(30); MoveWindow(hBtn[7], x, by, S(30), bh, TRUE);
-    x -= S(30) + S(4); MoveWindow(hBtn[6], x, by, S(30), bh, TRUE);
-    x -= S(70) + S(4); MoveWindow(hCount, x, by + S(6), S(70), bh - S(10), TRUE);
-    x -= S(240) + S(6);
-    SetRect(&g_searchRc, x, by, x + S(240), by + bh);
-    MoveWindow(hSearch, x + S(5), by + S(6), S(240) - S(10) - S(24), bh - S(12), TRUE);
-    MoveWindow(hBtn[9], x + S(240) - S(26), by + S(3), S(23), bh - S(6), TRUE);
+    for (i = 0; i < (int)(sizeof BL / sizeof BL[0]); i++) { MoveWindow(hBtn[BL[i].i], x, by, S(BL[i].w), bh, TRUE); x += S(BL[i].w) + S(BL[i].gap); }
+    MoveWindow(hBtn[10], x, by, S(104), bh, TRUE);
+    if (GetWindowLongW(hBtn[10], GWL_STYLE) & WS_VISIBLE) x += S(104) + S(6);
+    right = W - S(8) - S(30); MoveWindow(hBtn[7], right, by, S(30), bh, TRUE);
+    right -= S(30) + S(4); MoveWindow(hBtn[6], right, by, S(30), bh, TRUE);
+    right -= S(56) + S(4); MoveWindow(hCount, right, by + S(6), S(56), bh - S(10), TRUE);
+    sw = right - S(6) - (x + S(6)); if (sw > S(240)) sw = S(240); if (sw < S(120)) sw = S(120);
+    right -= sw + S(6);
+    SetRect(&g_searchRc, right, by, right + sw, by + bh);
+    MoveWindow(hSearch, right + S(5), by + S(6), sw - S(10) - S(24), bh - S(12), TRUE);
+    MoveWindow(hBtn[9], right + sw - S(26), by + S(3), S(23), bh - S(6), TRUE);
     ShowWindow(hBtn[9], GetWindowTextLengthW(hSearch) ? SW_SHOW : SW_HIDE);
     if (g_edit) {
         int sw = S(6), ew = (int)((W - sw) * g_split);
@@ -1212,7 +1869,7 @@ static void reg_save(void) {
    Najnovsie vydanie: tag "vX.Y" a prilozeny subor s nazvom presne MDView.exe.
    Kontrola bezi na pozadi; stiahnuty subor sa vymeni za beziace exe a aplikacia sa restartuje. */
 #ifndef APP_VERSION
-#define APP_VERSION "1.2"
+#define APP_VERSION "1.3"
 #endif
 #define UPD_API_HOST L"api.github.com"
 #define UPD_API_PATH L"/repos/JurajCyprich/MDView/releases/latest"
@@ -1293,7 +1950,7 @@ static void upd_check(int manual) {
 }
 static void upd_button(const wchar_t *text, int enabled) {
     SetWindowTextW(hBtn[10], text); EnableWindow(hBtn[10], enabled);
-    ShowWindow(hBtn[10], SW_SHOW); InvalidateRect(hBtn[10], NULL, TRUE);
+    ShowWindow(hBtn[10], SW_SHOW); layout(); InvalidateRect(hMain, NULL, TRUE); InvalidateRect(hBtn[10], NULL, TRUE);
 }
 static void upd_ask(void) {
     wchar_t m[300]; HANDLE t;
@@ -1407,17 +2064,178 @@ static HWND make_rich(HWND parent, int id, DWORD extra) {
     return h;
 }
 
+/* ---------- jednoduche okno na zadanie textu ---------- */
+static int g_ibDone, g_ibOk;
+static LRESULT CALLBACK InputProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    switch (m) {
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) { g_ibOk = 1; g_ibDone = 1; return 0; }
+        if (LOWORD(wp) == IDCANCEL) { g_ibDone = 1; return 0; }
+        break;
+    case WM_CLOSE: g_ibDone = 1; return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)wp, &rc, hbrBar); return 1; }
+    case WM_CTLCOLORSTATIC: SetTextColor((HDC)wp, T.barText); SetBkColor((HDC)wp, T.bar); return (LRESULT)hbrBar;
+    case WM_CTLCOLOREDIT: SetTextColor((HDC)wp, T.text); SetBkColor((HDC)wp, T.editBg); return (LRESULT)hbrEdit;
+    }
+    return DefWindowProcW(h, m, wp, lp);
+}
+static int input_box(const wchar_t *title, const wchar_t *prompt, wchar_t *buf, int cap) {
+    static int reg = 0; HINSTANCE hi = GetModuleHandleW(NULL); HWND dlg, ed, ok, cancel, st; RECT pr, cr;
+    int W = S(600), H = S(176), cw, ch; MSG msg; BOOL dk = g_dark; const wchar_t *thm = g_dark ? L"DarkMode_Explorer" : L"Explorer";
+    if (!reg) {
+        WNDCLASSW wc; ZeroMemory(&wc, sizeof wc);
+        wc.lpfnWndProc = InputProc; wc.hInstance = hi; wc.hCursor = LoadCursorW(NULL, IDC_ARROW); wc.lpszClassName = L"MDViewInput";
+        RegisterClassW(&wc); reg = 1;
+    }
+    GetWindowRect(hMain, &pr);
+    dlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"MDViewInput", title, WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                          pr.left + (pr.right - pr.left - W) / 2, pr.top + S(110), W, H, hMain, NULL, hi, NULL);
+    if (!dlg) return 0;
+    DwmSetWindowAttribute(dlg, 20, &dk, sizeof dk);
+    GetClientRect(dlg, &cr); cw = cr.right; ch = cr.bottom;
+    st = CreateWindowExW(0, L"STATIC", prompt, WS_CHILD | WS_VISIBLE, S(16), S(14), cw - S(32), S(20), dlg, NULL, hi, NULL);
+    ed = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", buf, WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL, S(16), S(40), cw - S(32), S(28), dlg, (HMENU)100, hi, NULL);
+    ok = CreateWindowExW(0, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, cw - S(208), ch - S(46), S(92), S(30), dlg, (HMENU)IDOK, hi, NULL);
+    cancel = CreateWindowExW(0, L"BUTTON", L"Zrušiť", WS_CHILD | WS_VISIBLE | WS_TABSTOP, cw - S(108), ch - S(46), S(92), S(30), dlg, (HMENU)IDCANCEL, hi, NULL);
+    SendMessageW(st, WM_SETFONT, (WPARAM)hUiFont, 0); SendMessageW(ed, WM_SETFONT, (WPARAM)hUiFont, 0);
+    SendMessageW(ok, WM_SETFONT, (WPARAM)hUiFont, 0); SendMessageW(cancel, WM_SETFONT, (WPARAM)hUiFont, 0);
+    SetWindowTheme(ok, thm, NULL); SetWindowTheme(cancel, thm, NULL); SetWindowTheme(ed, thm, NULL);
+    SendMessageW(ed, EM_LIMITTEXT, cap - 1, 0); SendMessageW(ed, EM_SETSEL, 0, -1);
+    EnableWindow(hMain, FALSE);
+    ShowWindow(dlg, SW_SHOW); SetFocus(ed);
+    g_ibDone = g_ibOk = 0;
+    while (!g_ibDone) {
+        int r = GetMessageW(&msg, NULL, 0, 0);
+        if (r <= 0) { PostQuitMessage(0); break; }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN) { if (GetFocus() == cancel) g_ibDone = 1; else { g_ibOk = 1; g_ibDone = 1; } continue; }
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { g_ibDone = 1; continue; }
+        if (!IsDialogMessageW(dlg, &msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+    }
+    if (g_ibOk) GetWindowTextW(ed, buf, cap);
+    EnableWindow(hMain, TRUE); DestroyWindow(dlg); SetForegroundWindow(hMain);
+    return g_ibOk;
+}
+static void trim_ws(wchar_t *s) {   /* medzery a uvodzovky okolo (napr. z "Kopirovat ako cestu") */
+    int n = (int)wcslen(s), a = 0;
+    while (n > 0 && (s[n - 1] == ' ' || s[n - 1] == '"' || s[n - 1] == '\r' || s[n - 1] == '\n' || s[n - 1] == '\t')) n--;
+    while (a < n && (s[a] == ' ' || s[a] == '"' || s[a] == '\t')) a++;
+    memmove(s, s + a, (n - a) * sizeof(wchar_t)); s[n - a] = 0;
+}
+/* adresa zo schranky, ak tam je odkaz alebo cesta (predvyplni okno) */
+static void clip_loc(wchar_t *out, int cap) {
+    HANDLE h; wchar_t *p, t[1100];
+    out[0] = 0;
+    if (!OpenClipboard(hMain)) return;
+    if ((h = GetClipboardData(CF_UNICODETEXT)) != NULL && (p = (wchar_t *)GlobalLock(h)) != NULL) {
+        lstrcpynW(t, p, 1100); GlobalUnlock(h);
+        if ((p = wcspbrk(t, L"\r\n")) != NULL) *p = 0;
+        trim_ws(t);
+        if (is_url(t) || (t[0] && t[1] == ':' && t[2] == '\\') || (t[0] == '\\' && t[1] == '\\')) lstrcpynW(out, t, cap);
+    }
+    CloseClipboard();
+}
+static int ask_location(wchar_t *v, int cap, const wchar_t *title) {
+    clip_loc(v, cap);
+    if (!input_box(title, L"Webová adresa (https://\x2026) alebo cesta k súboru v počítači:", v, cap)) return 0;
+    trim_ws(v);
+    return v[0] != 0;
+}
+/* Ctrl+L: otvori webovu adresu alebo cestu */
+static void open_url_dialog(void) {
+    wchar_t v[1100], *h;
+    if (!ask_location(v, 1100, L"Otvoriť adresu")) return;
+    if (is_url(v) && (h = wcschr(v, '#')) != NULL) { *h = 0; open_location(v, h + 1); }
+    else open_location(v, NULL);
+}
+/* normalizovany tvar adresy, v akom sa uklada a porovnava */
+static void loc_key(const wchar_t *v, wchar_t *out, int cap) {
+    if (is_url(v)) { wchar_t t[2200]; normalize_url(v, t, 2200); url_encode(t, out, cap); }
+    else if (!GetFullPathNameW(v, cap, out, NULL)) lstrcpynW(out, v, cap);
+}
+/* ulozi odkaz bez otvorenia dokumentu (z uvodnej stranky) */
+static void add_ref_dialog(void) {
+    wchar_t v[1100], key[1100], name[200];
+    if (!ask_location(v, 1100, L"Pridať odkaz")) return;
+    loc_key(v, key, 1100);
+    loc_name(key, name, 200);
+    if (!input_box(L"Pridať odkaz", L"Názov odkazu:", name, 200)) return;
+    trim_ws(name);
+    bm_add(name, key);
+    if (!g_path[0]) render(0);
+}
+/* ☆: ulozi otvoreny dokument medzi odkazy, alebo ho z nich odoberie */
+static void star_toggle(void) {
+    int i; wchar_t name[200], m[400];
+    if (!g_path[0]) { MessageBoxW(hMain, L"Najprv otvorte dokument (alebo ho uložte). Odkaz bez otvorenia pridáte na úvodnej stránke cez „Pridať odkaz“.", APP, MB_ICONINFORMATION); return; }
+    i = bm_find(g_path);
+    if (i >= 0) {
+        _snwprintf(m, 399, L"Odobrať „%s“ z uložených odkazov?", g_bm[i].name); m[399] = 0;
+        if (MessageBoxW(hMain, m, APP, MB_YESNO | MB_ICONQUESTION) == IDYES) bm_del(i);
+    } else {
+        wchar_t *w = get_text(hEdit, 0, NULL);
+        doc_title(w, name, 200); free(w);
+        if (!name[0]) loc_name(g_path, name, 200);
+        if (input_box(L"Uložiť odkaz", L"Názov odkazu (zobrazí sa na úvodnej stránke a v menu Odkazy):", name, 200)) { trim_ws(name); bm_add(name, g_path); }
+    }
+    star_update();
+}
+/* odkazy "mdview:..." na uvodnej stranke */
+static void home_cmd(const wchar_t *c) {
+    const wchar_t *q = wcschr(c, '?'); int k = q ? _wtoi(q + 1) : -1; wchar_t loc[1100];
+    if (!wcsncmp(c, L"open", 4)) do_open();
+    else if (!wcsncmp(c, L"url", 3)) open_url_dialog();
+    else if (!wcsncmp(c, L"add", 3)) add_ref_dialog();
+    else if (!wcsncmp(c, L"help", 4)) set_help(1);
+    else if (!wcsncmp(c, L"bm", 2) && k >= 0 && k < g_nbm) { lstrcpynW(loc, g_bm[k].loc, 1100); open_location(loc, NULL); }
+    else if (!wcsncmp(c, L"rc", 2) && k >= 0 && k < g_nrc) { lstrcpynW(loc, g_rc[k].loc, 1100); open_location(loc, NULL); }
+    else if (!wcsncmp(c, L"del", 3) && k >= 0 && k < g_nbm) {
+        wchar_t m[400]; _snwprintf(m, 399, L"Odstrániť odkaz „%s“?\n\n(Súbor ani stránka sa nemažú, len odkaz v MD View.)", g_bm[k].name); m[399] = 0;
+        if (MessageBoxW(hMain, m, APP, MB_YESNO | MB_ICONQUESTION) == IDYES) { bm_del(k); render(0); }
+    }
+}
+static void menu_text(const wchar_t *name, const wchar_t *right, wchar_t *out, int cap) {
+    int k = 0; const wchar_t *p;
+    for (p = name; *p && k < cap - 40; p++) { if (*p == '&') out[k++] = '&'; out[k++] = *p; }
+    out[k] = 0;
+    if (right) { wcscat(out, L"\t"); wcscat(out, right); }
+}
+/* tlacidlo "Odkazy ▾": ulozene a nedavne dokumenty bez zatvarania aktualneho */
+static void links_menu(void) {
+    HMENU m = CreatePopupMenu(), r = CreatePopupMenu(); RECT rc; int cmd, i; wchar_t t[300], loc[1100];
+    for (i = 0; i < g_nbm && i < 80; i++) { menu_text(g_bm[i].name, is_url(g_bm[i].loc) ? L"web" : L"PC", t, 300); AppendMenuW(m, MF_STRING | (!_wcsicmp(g_bm[i].loc, g_path) ? MF_CHECKED : 0), 1000 + i, t); }
+    if (!g_nbm) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(zatiaľ žiadne uložené odkazy)");
+    for (i = 0; i < g_nrc; i++) { menu_text(g_rc[i].name, is_url(g_rc[i].loc) ? L"web" : L"PC", t, 300); AppendMenuW(r, MF_STRING, 2000 + i, t); }
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_POPUP | (g_nrc ? 0 : MF_GRAYED), (UINT_PTR)r, L"Naposledy otvorené");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, ID_OPENURL, L"Otvoriť webovú adresu alebo cestu\x2026\tCtrl+L");
+    AppendMenuW(m, MF_STRING | (g_path[0] ? 0 : MF_GRAYED), ID_STAR, bm_find(g_path) >= 0 ? L"Odobrať z uložených odkazov\tCtrl+B" : L"Uložiť odkaz na tento dokument\tCtrl+B");
+    AppendMenuW(m, MF_STRING, ID_HOME, L"Domov \x2014 zavrieť dokument\tCtrl+W");
+    GetWindowRect(hBtn[12], &rc);
+    cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, rc.left, rc.bottom + S(2), 0, hMain, NULL);
+    DestroyMenu(m);
+    if (cmd >= 2000 && cmd - 2000 < g_nrc) { lstrcpynW(loc, g_rc[cmd - 2000].loc, 1100); open_location(loc, NULL); }
+    else if (cmd >= 1000 && cmd - 1000 < g_nbm) { lstrcpynW(loc, g_bm[cmd - 1000].loc, 1100); open_location(loc, NULL); }
+    else if (cmd) PostMessageW(hMain, WM_COMMAND, cmd, 0);
+}
+static void add_tip(HWND tip, HWND ctl, const wchar_t *text) {
+    TOOLINFOW ti; ZeroMemory(&ti, sizeof ti);
+    ti.cbSize = sizeof ti; ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS; ti.hwnd = hMain; ti.uId = (UINT_PTR)ctl; ti.lpszText = (LPWSTR)text;
+    SendMessageW(tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
 /* ---------- hlavne okno ---------- */
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     switch (m) {
     case WM_CREATE: {
-        static const struct { int id; const wchar_t *t; } bt[11] = {
+        static const struct { int id; const wchar_t *t; } bt[14] = {
             { ID_OPEN, L"Otvoriť" }, { ID_SAVE, L"Uložiť" }, { ID_EDIT, L"Upraviť" }, { ID_THEME, L"Tmavý" },
-            { ID_ZOOMOUT, L"A\x2212" }, { ID_ZOOMIN, L"A+" }, { ID_PREV, L"\x2039" }, { ID_NEXT, L"\x203A" }, { ID_HELP, L"Návod" }, { ID_CLEAR, L"\x2715" }, { ID_UPDATE, L"Aktualizovať" } };
-        int i; HINSTANCE hi = GetModuleHandleW(NULL);
+            { ID_ZOOMOUT, L"A\x2212" }, { ID_ZOOMIN, L"A+" }, { ID_PREV, L"\x2039" }, { ID_NEXT, L"\x203A" }, { ID_HELP, L"Návod" }, { ID_CLEAR, L"\x2715" }, { ID_UPDATE, L"Aktualizovať" },
+            { ID_HOME, L"Domov" }, { ID_LINKS, L"Odkazy \x25BE" }, { ID_STAR, L"\x2606" } };
+        int i; HINSTANCE hi = GetModuleHandleW(NULL); HWND tip;
         hMain = h;
         hUiFont = CreateFontW(-MulDiv(9, g_dpi, 72), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-        for (i = 0; i < 11; i++) {
+        for (i = 0; i < 14; i++) {
             hBtn[i] = CreateWindowExW(0, L"BUTTON", bt[i].t, WS_CHILD | (i == 10 ? 0 : WS_VISIBLE) | BS_OWNERDRAW, 0, 0, 10, 10, h, (HMENU)(INT_PTR)bt[i].id, hi, NULL);
             SendMessageW(hBtn[i], WM_SETFONT, (WPARAM)hUiFont, 0);
         }
@@ -1435,10 +2253,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         hView = make_rich(h, IDC_VIEW, ES_READONLY);
         SendMessageW(hView, EM_SETUNDOLIMIT, 0, 0);
         g_lastPane = hView;
+        tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX, 0, 0, 0, 0, h, NULL, hi, NULL);
+        add_tip(tip, hBtn[11], L"Zavrieť dokument a ukázať uložené odkazy (Ctrl+W)");
+        add_tip(tip, hBtn[12], L"Uložené a naposledy otvorené dokumenty, webová adresa (Ctrl+L)");
+        add_tip(tip, hBtn[13], L"Uložiť odkaz na tento dokument / odobrať ho (Ctrl+B)");
+        add_tip(tip, hBtn[0], L"Otvoriť súbor z počítača (Ctrl+O)");
+        add_tip(tip, hBtn[6], L"Predošlý výskyt (Shift+F3)");
+        add_tip(tip, hBtn[7], L"Ďalší výskyt (F3)");
+        add_tip(tip, hBtn[9], L"Zrušiť hľadanie (Esc)");
         hook_drop(h);
         layout();
         apply_theme();
-        set_title();
+        set_title(); star_update();
         return 0; }
     case WM_SIZE:
         if (wp != SIZE_MINIMIZED) {
@@ -1447,7 +2273,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
             g_lastViewW = r.right;
         }
         return 0;
-    case WM_GETMINMAXINFO: { MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(960); mm->ptMinTrackSize.y = S(300); return 0; }
+    case WM_GETMINMAXINFO: { MINMAXINFO *mm = (MINMAXINFO *)lp; mm->ptMinTrackSize.x = S(980); mm->ptMinTrackSize.y = S(300); return 0; }
     case WM_ERASEBKGND: {
         RECT rc; HDC dc = (HDC)wp; HPEN pen; HGDIOBJ ob, op; int foc = (GetFocus() == hSearch);
         GetClientRect(h, &rc); FillRect(dc, &rc, hbrBar);
@@ -1472,7 +2298,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         RoundRect(d->hDC, d->rcItem.left, d->rcItem.top, d->rcItem.right, d->rcItem.bottom, S(7), S(7));
         SelectObject(d->hDC, ob); SelectObject(d->hDC, op); DeleteObject(br); DeleteObject(pen);
         GetWindowTextW(d->hwndItem, t, 31);
-        SetBkMode(d->hDC, TRANSPARENT); SetTextColor(d->hDC, on ? RGB(255, 255, 255) : T.barText);
+        SetBkMode(d->hDC, TRANSPARENT); SetTextColor(d->hDC, on ? RGB(255, 255, 255) : (d->itemState & ODS_DISABLED) ? T.border : T.barText);
         SelectObject(d->hDC, hUiFont);
         DrawTextW(d->hDC, t, -1, &d->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         return TRUE; }
@@ -1498,9 +2324,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         KillTimer(h, wp);
-        if (wp == T_RENDER || wp == T_RESIZE) { render(0); sync_from(hEdit); }
+        if (wp == T_IMG) {   /* doplnili sa obrazky z webu: na vrchu ostane to iste miesto */
+            int cp = view_top_cp();
+            render(0);
+            g_syncing++; sc_set(hView, sc_y(hView, cp, sc_get(hView), sc_top(hView))); g_syncing--;
+            sync_mark();
+        }
+        else if (wp == T_RENDER || wp == T_RESIZE) { render(0); sync_from(hEdit); }
         else if (wp == T_FIND) find_changed();
         return 0;
+    case WM_APP_DOC: doc_arrived((NetJob *)lp); return 0;
+    case WM_APP_IMG: img_arrived((NetJob *)lp); SetTimer(h, T_IMG, 150, NULL); return 0;
     case WM_APP_UPDCHECK:
         g_updBusy = 0;
         if (lp == 1) { upd_button(L"Aktualizovať", TRUE); if (wp || g_updTest) upd_ask(); }
@@ -1520,16 +2354,17 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         return 0; }
     case WM_APP_DROP:
         SetForegroundWindow(h);
-        if (confirm_discard()) { wchar_t p[1024]; wcscpy(p, g_dropPath); load_file(p); }
+        { wchar_t p[1100], *hs; lstrcpynW(p, g_dropPath, 1100);
+          if (is_url(p) && (hs = wcschr(p, '#')) != NULL) { *hs = 0; open_location(p, hs + 1); } else open_location(p, NULL); }
         return 0;
     case WM_DROPFILES: {
         wchar_t path[1024]; HDROP d = (HDROP)wp;
-        if (DragQueryFileW(d, 0, path, 1024)) { DragFinish(d); SetForegroundWindow(h); if (confirm_discard()) load_file(path); }
+        if (DragQueryFileW(d, 0, path, 1024)) { DragFinish(d); SetForegroundWindow(h); open_location(path, NULL); }
         else DragFinish(d);
         return 0; }
     case WM_COMMAND: {
         int id = LOWORD(wp), code = HIWORD(wp);
-        if (id == IDC_EDITOR) { if (code == EN_CHANGE && !g_loading) { set_modified(1); SetTimer(h, T_RENDER, 250, NULL); } return 0; }
+        if (id == IDC_EDITOR) { if (code == EN_CHANGE && !g_loading) { set_modified(1); SetTimer(h, T_RENDER, g_nuse ? 600 : 250, NULL); } return 0; }
         if (id == IDC_SEARCH) {
             if (code == EN_CHANGE) { SetTimer(h, T_FIND, 200, NULL); ShowWindow(hBtn[9], GetWindowTextLengthW(hSearch) ? SW_SHOW : SW_HIDE); }
             else if (code == EN_SETFOCUS || code == EN_KILLFOCUS) InvalidateRect(h, &g_searchRc, TRUE);
@@ -1543,8 +2378,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         case ID_HELP: set_help(!g_help); break;
         case ID_UPDATE: upd_ask(); break;
         case ID_UPDCHECK: upd_check(1); break;
-        case ID_NEW: if (confirm_discard()) { g_help = 0; InvalidateRect(hBtn[8], NULL, TRUE); g_path[0] = 0; set_editor_text(L""); g_modified = 0; set_title(); render(1); if (!g_edit) set_edit_mode(1); } return 0;
-        case ID_RELOAD: if (g_path[0] && confirm_discard()) { wchar_t p[1024]; wcscpy(p, g_path); load_file(p); } break;
+        case ID_NEW: if (confirm_discard()) { g_help = 0; InvalidateRect(hBtn[8], NULL, TRUE); g_path[0] = 0; g_online = 0; set_editor_text(L""); g_modified = 0; set_title(); star_update(); render(1); if (!g_edit) set_edit_mode(1); } return 0;
+        case ID_RELOAD: if (g_path[0]) { wchar_t p[1024]; wcscpy(p, g_path); img_clear(); open_location(p, NULL); } else render(0); break;
+        case ID_HOME: go_home(); break;
+        case ID_LINKS: links_menu(); break;
+        case ID_STAR: star_toggle(); break;
+        case ID_OPENURL: open_url_dialog(); break;
         case ID_EDIT: set_edit_mode(!g_edit); return 0;
         case ID_THEME: g_dark = !g_dark; apply_theme(); break;
         case ID_ZOOMIN: set_zoom(g_fs + 2); break;
@@ -1581,7 +2420,8 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
         { FVIRTKEY, VK_F3, ID_NEXT }, { FSHIFT | FVIRTKEY, VK_F3, ID_PREV }, { FVIRTKEY, VK_ESCAPE, ID_ESC },
         { FCONTROL | FVIRTKEY, VK_OEM_PLUS, ID_ZOOMIN }, { FCONTROL | FVIRTKEY, VK_ADD, ID_ZOOMIN },
         { FCONTROL | FVIRTKEY, VK_OEM_MINUS, ID_ZOOMOUT }, { FCONTROL | FVIRTKEY, VK_SUBTRACT, ID_ZOOMOUT },
-        { FCONTROL | FVIRTKEY, '0', ID_ZOOM0 } };
+        { FCONTROL | FVIRTKEY, '0', ID_ZOOM0 },
+        { FCONTROL | FVIRTKEY, 'W', ID_HOME }, { FCONTROL | FVIRTKEY, 'L', ID_OPENURL }, { FCONTROL | FVIRTKEY, 'B', ID_STAR } };
     WNDCLASSEXW wc; MSG msg; HACCEL ha; HDC dc; int argc = 0; wchar_t **argv;
     (void)hp; (void)cmd;
 
@@ -1590,6 +2430,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     if (!LoadLibraryW(L"Msftedit.dll")) { MessageBoxW(NULL, L"Chýba Msftedit.dll.", APP, MB_ICONERROR); return 1; }
     dc = GetDC(NULL); g_dpi = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(NULL, dc);
     reg_load();
+    refs_load();
     T = g_dark ? DARK : LIGHT; hbrBar = CreateSolidBrush(T.bar); hbrEdit = CreateSolidBrush(T.editBg);
 
     ZeroMemory(&wc, sizeof wc); wc.cbSize = sizeof wc; wc.lpfnWndProc = WndProc; wc.hInstance = hi;
@@ -1600,7 +2441,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
     CreateWindowExW(0, L"MDViewMain", APP, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT, S(1100), S(780), NULL, NULL, hi, NULL);
     if (!hMain) return 1;
     argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (argv && argc > 1) load_file(argv[1]);
+    if (argv && argc > 1) open_location(argv[1], NULL);
 #ifdef MDV_TEST
     if (_wgetenv(L"MDV_TEST_VER")) { WideCharToMultiByte(CP_ACP, 0, _wgetenv(L"MDV_TEST_VER"), -1, g_ver, 31, NULL, NULL); g_updTest = 1; }
 #endif
@@ -1635,6 +2476,7 @@ int WINAPI wWinMain(HINSTANCE hi, HINSTANCE hp, LPWSTR cmd, int show) {
             }
             fclose(f);
         }
+        if (_wgetenv(L"MDV_TEST_LINK")) open_link(_wgetenv(L"MDV_TEST_LINK"));   /* ako klik na odkaz */
         if (_wgetenv(L"MDV_TEST_FIND")) {   /* predvyplni hladanie a skoci na 2. vyskyt */
             SetWindowTextW(hSearch, _wgetenv(L"MDV_TEST_FIND")); KillTimer(hMain, T_FIND);
             ShowWindow(hBtn[9], SW_SHOW); find_changed(); do_find(1, 0);
